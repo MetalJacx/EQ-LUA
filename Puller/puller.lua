@@ -70,6 +70,15 @@
         back above a higher "stop" % -- same hysteresis shape as triune.lua's
         MedBreak, scoped to the puller.
 
+    Deliberately out of scope (this is "find/tag/drag or fight", not a full
+    combat script): hazard-avoidance detours, navmesh-isolation recovery,
+    ladder-climb handling, breadcrumb backtracking, box-network pull
+    coordination, the named pull include-list, spell-loadout/castGem combat
+    rotations, and Hunt mode's "mob pulled me outside the anchor mid-fight"
+    exception handling (it just won't leash you back inside while already
+    engaged). Navigation is a plain /nav id|loc with a simple "no progress in
+    N seconds -> try to get unstuck, then give up on this mob for a while"
+    stall timeout, not a full stuck-recovery state machine.
 
     Usage: /lua run puller
     Commands: /puller start|stop|resume|pause|setcamp|clearcamp|addwp|
@@ -318,7 +327,7 @@ end
 
 local function navLoaded()
     local ok, loaded = pcall(function()
-        if mq.TLO.Navigation and (mq.TLO.Navigation() ~= nil or mq.TLO.Navigation.MeshLoaded() ~= nil) then
+        if mq.TLO.Navigation and (mq.TLO.Navigation() ~= nil or mq.TLO.Navigation.MeshLoaded() == true) then
             return true
         end
         local p = mq.TLO.Plugin('mq2nav')
@@ -455,6 +464,13 @@ local function inCombat()
                 if id > 0 and isHostileNpc(id) then return true end
             end
         end
+        -- Same non-XTarget fallback hasHostileThreat() already uses below --
+        -- without it, this "full combat check" (the comment at its call
+        -- site in the IDLE sweep literally says "not bare Me.Combat()")
+        -- could still miss a fight XTarget hasn't populated for yet, the
+        -- exact gap the fallback exists to cover elsewhere.
+        if currentTargetHasAggro() then return true end
+        if recentUnknownAttacker() ~= nil then return true end
         return false
     end)
     return ok and res or false
@@ -482,6 +498,32 @@ local function firstHostileXtargetExcept(excludeId)
         if xt() then
             local id = xt.ID() or 0
             if id > 0 and id ~= excludeId and isHostileNpc(id) then return id end
+        end
+    end
+    return nil
+end
+
+-- Same as firstHostileXtarget(), but skips anything still in tempIgnore.
+-- Used only by melee's FIGHTING-state reselect (state.pullTargetId died/went
+-- non-hostile, need a new chase target) -- NOT by hasHostileThreat() or
+-- anything else that's asking "is there a hostile at all" rather than
+-- "what should I chase next", since a tempIgnore'd mob is still a real
+-- threat, just not something melee should walk back into right away.
+-- Without this, a mob just abandoned via MELEE_CHASE_STUCK_SEC (LOS-blocked,
+-- still sitting on XTarget) gets immediately re-picked the moment the
+-- replacement target dies or drops hostile -- confirmed live: melee
+-- ping-ponged between an unreachable mob and whatever else was on XTarget,
+-- re-firing onEngageCommand (and never settling into a real rotation) every
+-- few seconds instead of after the normal 15s stuck window.
+local function firstHostileXtargetNotIgnored()
+    local now = os.clock()
+    local slots = mq.TLO.Me.XTargetSlots() or 13
+    for i = 1, slots do
+        local xt = mq.TLO.Me.XTarget(i)
+        if xt() then
+            local id = xt.ID() or 0
+            local until_ = id > 0 and state.tempIgnore[id]
+            if id > 0 and not (until_ and until_ > now) and isHostileNpc(id) then return id end
         end
     end
     return nil
@@ -1062,14 +1104,17 @@ local function fireTag(id)
     if style == 'Melee' then
         if not mq.TLO.Me.Combat() then mq.cmd('/attack on') end
     elseif style == 'Ranged' then
-        local tsReady = false
-        pcall(function() tsReady = mq.TLO.Me.AbilityReady('Throw Stone')() end)
+        -- The actual ranged-weapon attack (bow/thrown item in the Ranged
+        -- slot) is /autofire, not /attack (melee) or the Monk-only Throw
+        -- Stone skill. It's a toggle, not a fire-once command -- the client
+        -- keeps firing on its own once it's on, same as syncAutoAttack()
+        -- elsewhere in this file already expects (it reads Me.AutoFire()
+        -- and turns it off once nothing hostile is left). /attack would
+        -- turn autofire back off, so it's deliberately not used here.
         mq.cmd('/face fast')
-        if tsReady then
-            mq.cmd('/doability "Throw Stone"')
-        elseif not mq.TLO.Me.Combat() then
-            mq.cmd('/attack on')
-        end
+        local fireOn = false
+        pcall(function() fireOn = mq.TLO.Me.AutoFire() end)
+        if not fireOn then mq.cmd('/autofire on') end
     elseif style == 'Spell' then
         mq.cmd('/face fast')
         if cfg.pullSpell ~= '' and mq.TLO.Me.Casting() == nil then
@@ -1299,7 +1344,13 @@ local function enterFighting(id)
     -- "did the active target change" check still sees lastChaseId at its
     -- old/zeroed value on the first FIGHTING tick and fires onEngageCommand
     -- a SECOND time for the exact same fresh engagement.
-    state.lastChaseId = state.pullTargetId
+    -- Only when id was actually announced above, though: with id nil (a
+    -- swarm gather ending, a Camp arrival), nothing has fired for
+    -- pullTargetId yet. For Melee the FIGHTING sweep no longer announces
+    -- (the chase block owns onEngageCommand), so lastChaseId has to stay 0
+    -- here or the chase block would think its first target was already
+    -- handed off and never fire for it at all.
+    state.lastChaseId = id and state.pullTargetId or 0
     state.meleeChaseStuckSince = nil
 end
 
@@ -1324,6 +1375,28 @@ local function forceEngage()
     state.lastAnnounceAt = 0
     enterFighting(id) -- also syncs lastChaseId to id
     printf('Forced engagement on #%d.', id)
+end
+
+-- Shared by /puller stop|pause and the UI Stop button; defined up here (not
+-- down by cmd_puller) so both can call it without a forward-reference to a
+-- not-yet-defined local, same reasoning as forceEngage() above.
+-- Previously both call sites just flipped cfg.enabled, leaving any in-flight
+-- nav command running and leftover chase/gather/engage bookkeeping in place
+-- for the next /puller start to pick back up as if nothing happened.
+local function stopPulling()
+    cfg.enabled = false
+    saveCfg()
+    if mq.TLO.Navigation.Active() then mq.cmd('/nav stop') end
+    state.pullState = 'IDLE'
+    state.pullTargetId = 0
+    state.lastChaseId = 0
+    state.meleeChaseStuckSince = nil
+    state.engagedIds = {}
+    state.lastAnnounceAt = 0
+    state.swarmSkip = {}
+    state.swarmSummoned = false
+    state.swarmTagged = false
+    state.swarmAggroSince = nil
 end
 
 -- Periodic console status line, gated behind cfg.debugEnabled (Settings tab
@@ -1395,10 +1468,10 @@ local function pullTick()
         state.arcAiming.Camp = false
         if cfg.useWaypoints and cfg.waypoints and #cfg.waypoints > 0 then
             local wp1 = cfg.waypoints[1]
-            cfg.campLoc = { x = wp1.x, y = wp1.y, z = wp1.z }
+            cfg.campLoc = { x = wp1.x, y = wp1.y, z = wp1.z, zone = currentZoneShortName() }
             printf('Camp location initialized to Waypoint 1.')
         elseif x and y and z then
-            cfg.campLoc = { x = x, y = y, z = z }
+            cfg.campLoc = { x = x, y = y, z = z, zone = currentZoneShortName() }
             printf('Camp location initialized to current position.')
         else
             return
@@ -1433,10 +1506,13 @@ local function pullTick()
         -- pulls can be mid-fight with no melee swing up.
         if inCombat() then return end
 
+        -- lastScanAt only advances on an EMPTY scan: pullWait is meant to
+        -- throttle "still nothing up" re-checks, not to delay the next pick
+        -- right after a pull was dropped (con-blocked, unreachable).
         local id = nil
         if os.clock() - state.lastScanAt >= (cfg.pullWait or 0) then
-            state.lastScanAt = os.clock()
             id = findPullTarget()
+            if not id then state.lastScanAt = os.clock() end
         end
         if id then
             if isSittingOrDucking() then mq.cmd('/stand') end
@@ -1572,14 +1648,17 @@ local function pullTick()
             -- re-run the NearestSpawn scan every single tick instead of
             -- waiting cfg.pullWait between tries. Shared timestamp with
             -- IDLE's own scan is fine: IDLE and GATHER are never active at
-            -- the same time.
+            -- the same time. Like IDLE, only an EMPTY scan starts the wait --
+            -- otherwise every candidate that aggro'd quickly left you
+            -- standing still for up to pullWait seconds before walking to
+            -- the next one, with the batch so far chewing on you.
             if os.clock() - state.lastScanAt < (cfg.pullWait or 0) then return end
-            state.lastScanAt = os.clock()
             -- extraExclude: skip anything already aggro'd this batch (would
             -- just be found again instantly) and anything that already
             -- failed to aggro/reach for this batch.
             local nextId = findPullTarget(function(sid) return isOnXTarget(sid) or state.swarmSkip[sid] end)
             if not nextId then
+                state.lastScanAt = os.clock()
                 if haters > 0 then
                     -- Same nav-stop gap as the count-reached path above --
                     -- the dropped previous candidate's nav command can
@@ -1603,6 +1682,20 @@ local function pullTick()
             state.navUnstuckTried = false
             state.navLosBackoffCount = 0
             state.swarmChaseUntil = os.clock() + (cfg.swarmMaxChase or 45)
+            state.swarmAggroSince = nil
+            state.swarmTagged = false
+            return
+        end
+
+        -- Same con check TO_MOB runs. Without it the faction filter never
+        -- applied during a gather at all: nothing ever sent /consider, so
+        -- conCache stayed empty and findPullTarget's cached-tier check let
+        -- every tier through (an Amiable mob just burned swarmAggroWait).
+        if not verifyTargetCon(state.pullTargetId) then
+            printf('Gather candidate blocked by con filter -- skipping it.')
+            state.swarmSkip[state.pullTargetId] = true
+            if mq.TLO.Navigation.Active() then mq.cmd('/nav stop') end
+            state.pullTargetId = 0
             state.swarmAggroSince = nil
             state.swarmTagged = false
             return
@@ -1770,7 +1863,18 @@ local function pullTick()
             if xt() then
                 local xid = xt.ID() or 0
                 if xid > 0 and isHostileNpc(xid) and not state.engagedIds[xid] then
-                    if e3nEnabled and e3nSticking and xid == e3nMob then
+                    if cfg.pullStyle == 'Melee' then
+                        -- Melee's chase block below already re-fires
+                        -- onEngageCommand every time its active target
+                        -- changes. Announcing here too meant /target-ing
+                        -- each add and firing the command on it (e.g.
+                        -- /assistme sending the group to slot 1) while
+                        -- melee snapped straight back to its own target
+                        -- the same tick -- the group hopped to a new add
+                        -- every cooldown window, never on what you were
+                        -- actually hitting. Just mark it seen.
+                        state.engagedIds[xid] = true
+                    elseif e3nEnabled and e3nSticking and xid == e3nMob then
                         -- E3Next's ClearXTargets already has this one targeted
                         -- and is actively stuck to it; nothing to announce,
                         -- and no cooldown spent since we didn't send a command.
@@ -1804,11 +1908,14 @@ local function pullTick()
         if cfg.pullStyle == 'Melee' then
             local chaseId = state.pullTargetId
             if chaseId <= 0 or not isHostileNpc(chaseId) then
-                -- firstHostileXtarget() first (the normal case); if XTarget
-                -- doesn't show anything, recentUnknownAttacker() covers a
-                -- mob that's genuinely hitting you but invisible to XTarget
-                -- (same gap this whole fallback chain exists for).
-                chaseId = firstHostileXtarget() or recentUnknownAttacker()
+                -- firstHostileXtargetNotIgnored() first (the normal case,
+                -- skipping anything just abandoned as unreachable below --
+                -- otherwise a mob given up on seconds ago gets immediately
+                -- re-picked the moment whatever replaced it dies); if
+                -- XTarget doesn't show anything, recentUnknownAttacker()
+                -- covers a mob that's genuinely hitting you but invisible
+                -- to XTarget (same gap this whole fallback chain exists for).
+                chaseId = firstHostileXtargetNotIgnored() or recentUnknownAttacker()
                 if chaseId then state.pullTargetId = chaseId end
             end
             if chaseId and chaseId > 0 and isHostileNpc(chaseId) then
@@ -1857,6 +1964,12 @@ local function pullTick()
                             printf('Could not reach/see #%d (%s) for %ds -- switching to a different hostile.',
                                 chaseId, nm ~= '' and nm or '?', MELEE_CHASE_STUCK_SEC)
                             if mq.TLO.Navigation.Active() then mq.cmd('/nav stop') end
+                            -- Same 60s tempIgnore window the pulling-phase
+                            -- give-up uses -- without this, firstHostileXtar-
+                            -- getNotIgnored() above has nothing to skip and
+                            -- this exact mob gets re-picked (and re-stuck-
+                            -- on) the instant altId stops being eligible.
+                            state.tempIgnore[chaseId] = os.clock() + 60
                             state.pullTargetId = altId
                             state.meleeChaseStuckSince = nil
                         else
@@ -2078,7 +2191,8 @@ end
 local function drawGUI_()
     openGUI, drawGUI = ImGui.Begin('Puller##' .. myName, openGUI)
     if drawGUI then
-        ImGui.TextColored(statusColor(), statusLine())
+        local scR, scG, scB, scA = statusColor()
+        ImGui.TextColored(scR, scG, scB, scA, statusLine())
         ImGui.Separator()
         ImGui.Spacing()
 
@@ -2090,8 +2204,12 @@ local function drawGUI_()
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.24, 0.62, 0.28, 1.0)
         end
         if ImGui.Button(cfg.enabled and 'Stop##pullEnable' or 'Start##pullEnable', 100, 24) then
-            cfg.enabled = not cfg.enabled
-            saveCfg()
+            if cfg.enabled then
+                stopPulling()
+            else
+                cfg.enabled = true
+                saveCfg()
+            end
         end
         ImGui.PopStyleColor(2)
         ImGui.SameLine()
@@ -2118,7 +2236,7 @@ local function drawGUI_()
             if ImGui.Button('Set Camp Here') then
                 local x, y, z = mq.TLO.Me.X(), mq.TLO.Me.Y(), mq.TLO.Me.Z()
                 if x and y and z then
-                    cfg.campLoc = { x = x, y = y, z = z }
+                    cfg.campLoc = { x = x, y = y, z = z, zone = currentZoneShortName() }
                     cfg.campHeading = mq.TLO.Me.Heading.Degrees()
                     state.arcAiming.Camp = false
                     saveCfg()
@@ -2133,7 +2251,7 @@ local function drawGUI_()
             if ImGui.Button('Set Hunt Anchor Here') then
                 local x, y, z = mq.TLO.Me.X(), mq.TLO.Me.Y(), mq.TLO.Me.Z()
                 if x and y and z then
-                    cfg.huntAnchor = { x = x, y = y, z = z }
+                    cfg.huntAnchor = { x = x, y = y, z = z, zone = currentZoneShortName() }
                     cfg.huntHeading = mq.TLO.Me.Heading.Degrees()
                     state.arcAiming.Hunt = false
                     saveCfg()
@@ -2528,12 +2646,12 @@ local function cmd_puller(sub, arg1)
         cfg.enabled = true; saveCfg()
         printf('Pulling started.')
     elseif sub == 'stop' or sub == 'pause' then
-        cfg.enabled = false; saveCfg()
+        stopPulling()
         printf('Pulling stopped.')
     elseif sub == 'setcamp' then
         local x, y, z = mq.TLO.Me.X(), mq.TLO.Me.Y(), mq.TLO.Me.Z()
         if x and y and z then
-            cfg.campLoc = { x = x, y = y, z = z }
+            cfg.campLoc = { x = x, y = y, z = z, zone = currentZoneShortName() }
             cfg.campHeading = mq.TLO.Me.Heading.Degrees()
             state.arcAiming.Camp = false
             saveCfg()
@@ -2589,6 +2707,20 @@ printf('Loaded. /puller start to begin, /puller help for commands.')
 
 local lastZoneId = mq.TLO.Zone.ID()
 
+-- Camp/anchor points saved before they carried a zone tag: assume they
+-- belong to the zone the script is started in (the usual case), so the
+-- zone-change pause below has something to compare against.
+do
+    local zs = currentZoneShortName()
+    if zs ~= '' then
+        local tagged = false
+        for _, loc in ipairs({ cfg.campLoc or false, cfg.huntAnchor or false }) do
+            if loc and not loc.zone then loc.zone = zs; tagged = true end
+        end
+        if tagged then saveCfg() end
+    end
+end
+
 while running do
     mq.doevents()
 
@@ -2598,12 +2730,44 @@ while running do
     -- all three on zone change is both the correctness fix (stale ids/
     -- considers from elsewhere) and what keeps them from growing without
     -- bound over a long session.
+    -- pullTargetId/lastChaseId/lastHitById are the exact same kind of
+    -- per-zone-instance id -- a stale one left pointing at whatever
+    -- numeric id it last held can, after zoning, resolve to a different,
+    -- unrelated spawn that happens to reuse that id in the new zone (or to
+    -- nothing at all). Reset alongside the caches above for the same
+    -- reason; cfg.enabled is left alone so pulling just continues fresh in
+    -- the new zone instead of needing a manual /puller start every zone.
     local zoneId = mq.TLO.Zone.ID()
     if zoneId ~= lastZoneId then
         lastZoneId = zoneId
         state.tempIgnore = {}
         state.conCache = {}
+        state.pullState = 'IDLE'
+        state.pullTargetId = 0
+        state.lastChaseId = 0
+        state.lastHitById = 0
+        state.lastHitAt = 0
+        state.meleeChaseStuckSince = nil
+        state.engagedIds = {}
+        state.swarmSkip = {}
+        state.swarmSummoned = false
+        state.swarmTagged = false
+        state.swarmAggroSince = nil
         state.conAskedAt = {}
+        -- The old /maploc marker belonged to the previous zone; forget it so
+        -- syncMapCircle redraws here instead of assuming it's still shown.
+        state.mapLocLoc = nil
+        state.mapLocRadius = nil
+        -- campLoc/huntAnchor are coordinates in the zone they were set in.
+        -- Carrying on here would scan around (and, with Return to AP, walk
+        -- toward) a meaningless spot in this zone, so pause instead.
+        local anchor = cfg.pullMode == 'Camp' and cfg.campLoc or cfg.huntAnchor
+        local zs = currentZoneShortName()
+        if cfg.enabled and anchor and anchor.zone and zs ~= '' and anchor.zone ~= zs then
+            stopPulling()
+            printf('Zoned out of %s (where the %s is set) -- pulling paused. Set a new one here, then /puller start.',
+                anchor.zone, cfg.pullMode == 'Camp' and 'camp' or 'hunt anchor')
+        end
     end
 
     -- Backstop for long sessions that never zone: sweep out tempIgnore
@@ -2631,6 +2795,7 @@ while running do
 end
 
 removeMapLocCircle()
+if mq.TLO.Navigation.Active() then mq.cmd('/nav stop') end
 mq.unbind('/puller')
 mq.unbind('/pullerexit')
 mq.exit()
