@@ -300,10 +300,17 @@ local function printf(fmt, ...)
     print(string.format('%s %s', header, string.format(fmt, ...)))
 end
 
+-- 3D, not Spawn.Distance() (X/Y only): EQ's own melee/spell range checks
+-- include height, so on a slope, stairs, or a mob up on a ledge a "12" flat
+-- distance could really be 14-15 -- reported in range here, out of range
+-- for Flying Kick and friends.
 local function distToId(id)
     if not id or id <= 0 then return 9999 end
     local d = 9999
-    pcall(function() d = mq.TLO.Spawn(id).Distance() or 9999 end)
+    pcall(function()
+        local s = mq.TLO.Spawn(id)
+        d = s.Distance3D() or s.Distance() or 9999
+    end)
     return d
 end
 
@@ -491,16 +498,24 @@ end
 -- Same, but skips one specific id -- used to find a DIFFERENT hostile to
 -- switch to when the one currently being chased turns out to be stuck
 -- (LOS-blocked, unreachable) despite other options being available.
-local function firstHostileXtargetExcept(excludeId)
+-- NEAREST, not first by slot: XTarget slot order is just aggro order, and
+-- after a big swarm slot 1 can easily be a mob 400 units away while others
+-- are already in your face (confirmed live in codecay: melee walked off
+-- toward a far slot-1 mob with ~20 on XTarget, several within ~100).
+local function nearestHostileXtargetExcept(excludeId)
+    local bestId, bestD = nil, math.huge
     local slots = mq.TLO.Me.XTargetSlots() or 13
     for i = 1, slots do
         local xt = mq.TLO.Me.XTarget(i)
         if xt() then
             local id = xt.ID() or 0
-            if id > 0 and id ~= excludeId and isHostileNpc(id) then return id end
+            if id > 0 and id ~= excludeId and isHostileNpc(id) then
+                local d = distToId(id)
+                if d < bestD then bestId, bestD = id, d end
+            end
         end
     end
-    return nil
+    return bestId
 end
 
 -- Same as firstHostileXtarget(), but skips anything still in tempIgnore.
@@ -515,18 +530,23 @@ end
 -- ping-ponged between an unreachable mob and whatever else was on XTarget,
 -- re-firing onEngageCommand (and never settling into a real rotation) every
 -- few seconds instead of after the normal 15s stuck window.
-local function firstHostileXtargetNotIgnored()
+-- Nearest, not first by slot -- same reason as nearestHostileXtargetExcept.
+local function nearestHostileXtargetNotIgnored()
     local now = os.clock()
+    local bestId, bestD = nil, math.huge
     local slots = mq.TLO.Me.XTargetSlots() or 13
     for i = 1, slots do
         local xt = mq.TLO.Me.XTarget(i)
         if xt() then
             local id = xt.ID() or 0
             local until_ = id > 0 and state.tempIgnore[id]
-            if id > 0 and not (until_ and until_ > now) and isHostileNpc(id) then return id end
+            if id > 0 and not (until_ and until_ > now) and isHostileNpc(id) then
+                local d = distToId(id)
+                if d < bestD then bestId, bestD = id, d end
+            end
         end
     end
-    return nil
+    return bestId
 end
 
 -- Swarm Pull's own "how many have I gathered" count. Uses XTarget's
@@ -751,7 +771,11 @@ local function navBackoffFromId(id, backDist)
     mq.cmdf('/nav locyx %.2f %.2f', my + uy * backDist, mx + ux * backDist)
 end
 
-local function navTowardId(id, dist)
+-- approach (optional, defaults to dist): how close /nav actually walks in.
+-- Melee passes something inside dist so arrival lands mid-range rather than
+-- on its edge (see pullApproach).
+local function navTowardId(id, dist, approach)
+    approach = approach or dist
     local d = distToId(id)
     local inRange = d <= dist
     local los = hasLos(id)
@@ -795,7 +819,7 @@ local function navTowardId(id, dist)
                 mq.cmdf('/nav id %d distance=5', id)
             end
         else
-            mq.cmdf('/nav id %d distance=%d', id, math.floor(dist))
+            mq.cmdf('/nav id %d distance=%d', id, math.floor(approach))
         end
     end
     return false, true
@@ -835,7 +859,12 @@ local function currentAnchor()
         if cfg.huntAnchor and (cfg.huntRadius or 0) > 0 then
             return cfg.huntAnchor, cfg.huntRadius, cfg.huntArcWidth or 0, cfg.huntHeading
         end
-        return nil, cfg.waypointScanRadius or 150, 0, nil
+        -- Unrestricted (radius 0 / no anchor) means zone-wide: nil radius,
+        -- and findPullTarget drops the radius clause entirely. This used to
+        -- borrow waypointScanRadius (a Waypoints-tab setting, 100 by
+        -- default), so "unlimited" really meant "100 around you" -- one
+        -- pull cleared that bubble and it never found anything again.
+        return nil, nil, 0, nil
     end
     return cfg.campLoc, cfg.campRadius or 100, cfg.campArcWidth or 0, cfg.campHeading
 end
@@ -918,7 +947,7 @@ local function findPullTarget(extraExclude)
     local minLevel = math.min(cfg.minLevel or 1, cfg.maxLevel or 100)
     local maxLevel = math.max(cfg.minLevel or 1, cfg.maxLevel or 100)
     local zradius = (cfg.pullMode == 'Hunt') and (cfg.huntZ or 75) or (cfg.campZ or 75)
-    local scanRadius = radius or 150
+    local scanRadius = radius -- nil = unrestricted Hunt: no radius clause, whole zone
     if anchor then
         -- NearestSpawn's own radius filter is relative to the PLAYER, not
         -- the anchor. Standing near the far edge of the anchor circle with
@@ -932,7 +961,9 @@ local function findPullTarget(extraExclude)
         local dx, dy = mx - anchor.x, my - anchor.y
         scanRadius = math.ceil(math.sqrt(dx * dx + dy * dy) + radius)
     end
-    local p = string.format('npc radius %d zradius %d targetable', scanRadius, zradius)
+    local p = scanRadius
+        and string.format('npc radius %d zradius %d targetable', scanRadius, zradius)
+        or string.format('npc zradius %d targetable', zradius)
     local mx, my, mz = mq.TLO.Me.X() or 0, mq.TLO.Me.Y() or 0, mq.TLO.Me.Z() or 0
     -- NearestSpawn with no `sort` clause orders candidates by its own
     -- default, which is 2D distance (X/Y only, ignoring Z) -- a mob on a
@@ -1030,9 +1061,27 @@ end
 -- ----------------------------------------------------------------------------
 -- Pull tagging
 -- ----------------------------------------------------------------------------
-local function pullReach()
+-- Two fractions of melee range, not one: "in range" is checked at
+-- CHECK_FRAC, but the approach walks in to APPROACH_FRAC. Navigating to
+-- exactly the cutoff parked you right on the edge, where half a step from
+-- the mob put you out of range for abilities (Flying Kick etc) while this
+-- still read "arrived" and didn't move.
+-- Deliberately a fixed base, NOT Spawn.MaxRangeTo()/MaxMeleeTo(): those
+-- call into the EQ client's own melee-range function, and polling them
+-- every tick crashed the client on this emu build within minutes
+-- (2026-10-16). 12 is EQ's melee range between two normal-size (6)
+-- models; smaller models get more, so this is the conservative case.
+local MELEE_RANGE_BASE = 12
+local MELEE_CHECK_FRAC = 0.9
+local MELEE_APPROACH_FRAC = 0.65
+
+local function meleeRange(id)
+    return MELEE_RANGE_BASE
+end
+
+local function pullReach(id)
     local style = cfg.pullStyle or 'Melee'
-    if style == 'Melee' then return 12 end
+    if style == 'Melee' then return meleeRange(id) * MELEE_CHECK_FRAC end
     local reach = cfg.engageDist or 100
     local cap = 0
     if style == 'Spell' and cfg.pullSpell ~= '' then
@@ -1051,6 +1100,15 @@ local function pullReach()
     return reach
 end
 
+-- How close to navigate before calling it there -- deeper than pullReach
+-- for Melee (see MELEE_APPROACH_FRAC above), unchanged for other styles.
+local function pullApproach(id)
+    if (cfg.pullStyle or 'Melee') == 'Melee' then
+        return math.max(4, math.floor(meleeRange(id) * MELEE_APPROACH_FRAC))
+    end
+    return math.floor(pullReach(id))
+end
+
 -- FIGHTING's own "close the gap" helper for Melee pulls, separate from
 -- navTowardId on purpose: once you're actually FIGHTING there's no "give
 -- up and blacklist the mob" concept the way there is while still pulling
@@ -1059,7 +1117,8 @@ end
 -- same point-blank backoff for a thin-wall/pillar LOS block, without
 -- touching navTowardId's own stall/unstuck/give-up counters.
 local function meleeCloseOnTarget(id)
-    local reach = pullReach()
+    local reach = pullReach(id)
+    local approach = pullApproach(id)
     local d = distToId(id)
     local inRange = d <= reach
     local los = hasLos(id)
@@ -1079,7 +1138,7 @@ local function meleeCloseOnTarget(id)
         if inRange and not los and d <= NAV_LOS_POINTBLANK then
             navBackoffFromId(id, reach + 15)
         else
-            mq.cmdf('/nav id %d distance=%d', id, inRange and 5 or math.floor(reach))
+            mq.cmdf('/nav id %d distance=%d', id, inRange and 5 or approach)
         end
     end
     return false
@@ -1332,6 +1391,12 @@ end
 -- condition. Always fires immediately, unlike the FIGHTING sweep below --
 -- this is the "pull just landed, go fight" signal.
 local function enterFighting(id)
+    -- A gather ending (count reached, summon, HP abort, nothing left) left
+    -- pullTargetId on whichever candidate it was still WALKING to -- often
+    -- far off and not even aggro'd yet -- and melee then chased that one
+    -- across the zone with a pile already on XTarget. Drop it so melee's
+    -- reselect picks the nearest actual hater instead.
+    if not id and state.pullState == 'GATHER' then state.pullTargetId = 0 end
     if id then state.pullTargetId = id end
     state.pullState = 'FIGHTING'
     if id then announceEngage(id) end
@@ -1440,7 +1505,7 @@ local function printDebugStatus()
     local anchorInfo = anchor
         and string.format('anchor=(%.0f,%.0f) r=%.0f arc=%.0f@%.0f', anchor.y, anchor.x, radius or 0,
             arcWidth or 0, arcHeading or 0)
-        or string.format('anchor=none r=%.0f(scan cap)', radius or 0)
+        or (radius and string.format('anchor=none r=%.0f(scan cap)', radius) or 'anchor=none r=unrestricted')
 
     printf('DEBUG enabled=%s resting=%s mode=%s %s state=%s target=#%d(%s) dist=%.0f los=%s combat=%s autofire=%s xtHostiles=%d%s hp=%d%%',
         tostring(cfg.enabled), tostring(state.resting), cfg.pullMode, anchorInfo, state.pullState, tgtId, tgtName, tgtDist, tgtLos,
@@ -1766,7 +1831,7 @@ local function pullTick()
             return
         end
 
-        local arrived, stillGoing = navTowardId(id, pullReach())
+        local arrived, stillGoing = navTowardId(id, pullReach(id), pullApproach(id))
         if not stillGoing then
             printf('Giving up on an unreachable mob -- will retry it later.')
             state.tempIgnore[id] = os.clock() + 60
@@ -1908,14 +1973,14 @@ local function pullTick()
         if cfg.pullStyle == 'Melee' then
             local chaseId = state.pullTargetId
             if chaseId <= 0 or not isHostileNpc(chaseId) then
-                -- firstHostileXtargetNotIgnored() first (the normal case,
+                -- nearestHostileXtargetNotIgnored() first (the normal case,
                 -- skipping anything just abandoned as unreachable below --
                 -- otherwise a mob given up on seconds ago gets immediately
                 -- re-picked the moment whatever replaced it dies); if
                 -- XTarget doesn't show anything, recentUnknownAttacker()
                 -- covers a mob that's genuinely hitting you but invisible
                 -- to XTarget (same gap this whole fallback chain exists for).
-                chaseId = firstHostileXtargetNotIgnored() or recentUnknownAttacker()
+                chaseId = nearestHostileXtargetNotIgnored() or recentUnknownAttacker()
                 if chaseId then state.pullTargetId = chaseId end
             end
             if chaseId and chaseId > 0 and isHostileNpc(chaseId) then
@@ -1957,7 +2022,7 @@ local function pullTick()
                     -- instead of retrying the same stuck one forever.
                     state.meleeChaseStuckSince = state.meleeChaseStuckSince or os.clock()
                     if os.clock() - state.meleeChaseStuckSince > MELEE_CHASE_STUCK_SEC then
-                        local altId = firstHostileXtargetExcept(chaseId)
+                        local altId = nearestHostileXtargetExcept(chaseId)
                         if altId then
                             local nm = ''
                             pcall(function() nm = mq.TLO.Spawn(chaseId).CleanName() or '' end)
@@ -1965,7 +2030,7 @@ local function pullTick()
                                 chaseId, nm ~= '' and nm or '?', MELEE_CHASE_STUCK_SEC)
                             if mq.TLO.Navigation.Active() then mq.cmd('/nav stop') end
                             -- Same 60s tempIgnore window the pulling-phase
-                            -- give-up uses -- without this, firstHostileXtar-
+                            -- give-up uses -- without this, nearestHostileXtar-
                             -- getNotIgnored() above has nothing to skip and
                             -- this exact mob gets re-picked (and re-stuck-
                             -- on) the instant altId stops being eligible.
@@ -1993,7 +2058,7 @@ local function pullTick()
                             printf('Still stuck on #%d (%s) with nothing else to switch to -- backing off to try a different angle.',
                                 chaseId, nm ~= '' and nm or '?')
                             if mq.TLO.Navigation.Active() then mq.cmd('/nav stop') end
-                            navBackoffFromId(chaseId, (pullReach() or 12) + 20)
+                            navBackoffFromId(chaseId, pullReach(chaseId) + 20)
                             state.meleeChaseStuckSince = os.clock()
                         end
                     end
