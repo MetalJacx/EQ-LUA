@@ -138,6 +138,13 @@ local function defaultCfg()
         campLoc = nil,
         campRadius = 100,
         campZ = 75,
+        -- Camp Safe Radius: once you're back at camp, a mob isn't engaged
+        -- (melee chase, onEngageCommand) until it's within this many units
+        -- of the camp point -- otherwise the moment a drag got home melee
+        -- ran straight back out after whatever on XTarget was nearest, even
+        -- 100+ units away, dragging the fight out of camp. 0 = off. Drawn
+        -- as a green circle on the EQ map alongside the red pull radius.
+        campSafeRadius = 30,
         -- Pull arc, like KissAssist's /setpullarc: 0 = disabled (full
         -- circle), else only mobs within +/- width/2 of campHeading are
         -- pullable. campHeading is captured automatically from your facing
@@ -175,7 +182,9 @@ local function defaultCfg()
         -- Waypoint Patrol: walked in order when no target is in range,
         -- scanned for targets along the way. Available under either mode.
         useWaypoints = false,
-        waypoints = {},         -- { {x=, y=, z=, name=}, ... }
+        waypoints = {},         -- { {x=, y=, z=, name=, cmd=, delay=}, ... }
+                                -- cmd: run once on arrival ('' = none); delay: seconds to
+                                -- hold there before moving on (0 = none)
         waypointRadius = 20,    -- arrival distance per waypoint
         waypointScanRadius = 100, -- how far to scan for targets while patrolling
         waypointLoop = true,    -- true: always forward, wraps; false: ping-pong
@@ -266,8 +275,13 @@ local state = {
     conAskedAt = {},
     wpIndex = 1,
     wpDirection = 1,
+    wpArrivedIdx = nil,    -- waypoint index whose arrival cmd/delay already fired (nil once we leave it)
+    wpWaitUntil = 0,       -- os.clock() the current waypoint's delay ends
     mapLocLoc = nil,       -- {x=,y=,z=} of the anchor circle currently drawn, if any
     mapLocRadius = nil,    -- radius currently drawn at mapLocLoc
+    safeLocLoc = nil,      -- same, for the green Camp Safe Radius circle
+    safeLocRadius = nil,
+    campSafeBypassId = 0,  -- Force Engage target: exempt from the Camp Safe Radius wait
     restFightingSince = nil, -- os.clock() a fighting signal first appeared while resting
     lastPruneAt = 0,       -- os.clock() of the last tempIgnore sweep
     lastScanAt = 0,        -- os.clock() of the last IDLE target scan (pullWait throttle)
@@ -373,6 +387,27 @@ local function isHostileNpc(id)
         if masterIsPc then return false end
     end
     return true
+end
+
+-- Camp mode: is this mob inside the Camp Safe Radius (cfg.campSafeRadius
+-- around campLoc)? Always true outside Camp mode, with no camp set, with
+-- the radius at 0 (off), or for a Force Engage target. Gates what FIGHTING
+-- will chase/announce, so a fight stays in camp instead of melee running
+-- back out after the nearest XTarget entry the moment a drag gets home.
+local function inCampSafeZone(id)
+    if cfg.pullMode ~= 'Camp' or not cfg.campLoc then return true end
+    local r = cfg.campSafeRadius or 0
+    if r <= 0 then return true end
+    if id and id == state.campSafeBypassId then return true end
+    local sx, sy, sz
+    local ok = pcall(function()
+        local s = mq.TLO.Spawn(id)
+        sx, sy, sz = s.X(), s.Y(), s.Z()
+    end)
+    if not ok or not sx or not sy then return false end
+    local c = cfg.campLoc
+    local dx, dy, dz = sx - c.x, sy - c.y, (sz or c.z or 0) - (c.z or sz or 0)
+    return dx * dx + dy * dy + dz * dz <= r * r
 end
 
 -- Resolves a combat-log attacker blob (e.g. "A haunted chest hits" -- the
@@ -502,14 +537,14 @@ end
 -- after a big swarm slot 1 can easily be a mob 400 units away while others
 -- are already in your face (confirmed live in codecay: melee walked off
 -- toward a far slot-1 mob with ~20 on XTarget, several within ~100).
-local function nearestHostileXtargetExcept(excludeId)
+local function nearestHostileXtargetExcept(excludeId, filter)
     local bestId, bestD = nil, math.huge
     local slots = mq.TLO.Me.XTargetSlots() or 13
     for i = 1, slots do
         local xt = mq.TLO.Me.XTarget(i)
         if xt() then
             local id = xt.ID() or 0
-            if id > 0 and id ~= excludeId and isHostileNpc(id) then
+            if id > 0 and id ~= excludeId and isHostileNpc(id) and (not filter or filter(id)) then
                 local d = distToId(id)
                 if d < bestD then bestId, bestD = id, d end
             end
@@ -531,7 +566,7 @@ end
 -- re-firing onEngageCommand (and never settling into a real rotation) every
 -- few seconds instead of after the normal 15s stuck window.
 -- Nearest, not first by slot -- same reason as nearestHostileXtargetExcept.
-local function nearestHostileXtargetNotIgnored()
+local function nearestHostileXtargetNotIgnored(filter)
     local now = os.clock()
     local bestId, bestD = nil, math.huge
     local slots = mq.TLO.Me.XTargetSlots() or 13
@@ -540,7 +575,7 @@ local function nearestHostileXtargetNotIgnored()
         if xt() then
             local id = xt.ID() or 0
             local until_ = id > 0 and state.tempIgnore[id]
-            if id > 0 and not (until_ and until_ > now) and isHostileNpc(id) then
+            if id > 0 and not (until_ and until_ > now) and isHostileNpc(id) and (not filter or filter(id)) then
                 local d = distToId(id)
                 if d < bestD then bestId, bestD = id, d end
             end
@@ -965,29 +1000,40 @@ local function findPullTarget(extraExclude)
         and string.format('npc radius %d zradius %d targetable', scanRadius, zradius)
         or string.format('npc zradius %d targetable', zradius)
     local mx, my, mz = mq.TLO.Me.X() or 0, mq.TLO.Me.Y() or 0, mq.TLO.Me.Z() or 0
-    -- NearestSpawn with no `sort` clause orders candidates by its own
-    -- default, which is 2D distance (X/Y only, ignoring Z) -- a mob on a
-    -- balcony/pit floor directly above or below you can rank "nearer" than
-    -- one actually closer in real 3D space. So this doesn't just take the
-    -- first candidate that passes every filter (MQ2's order) -- it scans
-    -- everything NearestSpawn hands back and keeps the true-closest (real
-    -- 3D distance from you) among whatever actually qualifies.
+    -- Ranked by WALKING distance (MQ2Nav PathLength), not straight-line:
+    -- a mob 40 units away on the other side of a wall can be a 600-unit
+    -- walk around the instance, and straight-line ranking happily picked it
+    -- over one 80 units away down an open hall. Straight-line distance is
+    -- only the fallback when nav isn't loaded or a length can't be had.
+    --
+    -- PathLength is a full path computation per candidate, so this stops
+    -- early: NearestSpawn hands candidates back nearest-first by flat
+    -- distance, and no walk is ever shorter than the flat distance, so once
+    -- a candidate's flat distance reaches the best walk found so far, no
+    -- later candidate can beat it. (Skipped while a priority list is in
+    -- play -- a priority name further out still has to be found.)
     local bestId, bestDist = nil, math.huge
     -- Priority Kill List candidates are tracked separately and, if any
     -- qualify, win over bestId entirely at the end -- closest-among-
     -- priority-names, not closest-overall. Still has to pass every filter
     -- below same as anything else; this only changes which one gets picked.
     local bestPriorityId, bestPriorityDist = nil, math.huge
+    local hasPriority = currentPriorityList() ~= nil
+    local useNav = navLoaded()
     for i = 1, 60 do
         local s = mq.TLO.NearestSpawn(i, p)
         if not s() then break end
         local sid = s.ID() or 0
+        local sx, sy, sz = s.X() or 0, s.Y() or 0, s.Z() or 0
+        if bestId and not hasPriority then
+            local fdx, fdy = sx - mx, sy - my
+            if math.sqrt(fdx * fdx + fdy * fdy) >= bestDist then break end
+        end
         local until_ = sid > 0 and state.tempIgnore[sid]
         if sid > 0 and not (until_ and until_ > now) and not (extraExclude and extraExclude(sid)) then
             local slvl = s.Level() or 0
             if slvl >= minLevel and slvl <= maxLevel and isHostileNpc(sid) then
                 local inAnchor = true
-                local sx, sy, sz = s.X() or 0, s.Y() or 0, s.Z() or 0
                 if anchor then
                     local dx, dy = sx - anchor.x, sy - anchor.y
                     inAnchor = (dx * dx + dy * dy) <= (radius * radius)
@@ -999,18 +1045,28 @@ local function findPullTarget(extraExclude)
                     local cname = s.CleanName()
                     local tier = cname and state.conCache[cname]
                     if not tier or cfg.conFilter[tier] ~= false then
-                        if navLoaded() then
-                            local ok, exists = pcall(function() return mq.TLO.Navigation.PathExists('id ' .. sid)() end)
-                            if ok and not exists then goto continue end
-                        end
                         local ddx, ddy, ddz = sx - mx, sy - my, sz - mz
-                        local d3 = ddx * ddx + ddy * ddy + ddz * ddz
-                        if d3 < bestDist then
-                            bestDist = d3
+                        local dist = math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz)
+                        if useNav then
+                            local ok, plen = pcall(function()
+                                return tonumber(mq.TLO.Navigation.PathLength('id ' .. sid)())
+                            end)
+                            if ok and plen and plen > 0 then
+                                dist = plen
+                            else
+                                -- No length back (MQ2Nav answers -1 for no
+                                -- path): confirm reachability the old way
+                                -- before trusting straight-line distance.
+                                local ok2, exists = pcall(function() return mq.TLO.Navigation.PathExists('id ' .. sid)() end)
+                                if ok2 and not exists then goto continue end
+                            end
+                        end
+                        if dist < bestDist then
+                            bestDist = dist
                             bestId = sid
                         end
-                        if isPriorityName(cname) and d3 < bestPriorityDist then
-                            bestPriorityDist = d3
+                        if isPriorityName(cname) and dist < bestPriorityDist then
+                            bestPriorityDist = dist
                             bestPriorityId = sid
                         end
                     end
@@ -1034,6 +1090,23 @@ local function patrolTick()
 
     local radius = cfg.waypointRadius or 20
     if distToLoc(wp.x, wp.y, wp.z) <= radius then
+        -- Arrival: run this waypoint's command once and start its delay.
+        -- wpArrivedIdx (cleared only once we're outside the radius again)
+        -- keeps a single-waypoint route, or coming back from a pull that
+        -- interrupted the wait, from re-firing the command every tick.
+        if state.wpArrivedIdx ~= state.wpIndex then
+            state.wpArrivedIdx = state.wpIndex
+            if mq.TLO.Navigation.Active() then mq.cmd('/nav stop') end
+            if wp.cmd and wp.cmd ~= '' then
+                printf('Waypoint %d (%s): %s', state.wpIndex, wp.name or '?', wp.cmd)
+                mq.cmd(wp.cmd)
+            end
+            state.wpWaitUntil = os.clock() + (tonumber(wp.delay) or 0)
+        end
+        -- Holding here: IDLE still scans for targets before calling this
+        -- each tick, so a mob showing up mid-delay still gets pulled.
+        if os.clock() < state.wpWaitUntil then return true end
+
         local prevIdx = state.wpIndex
         if #wps <= 1 then
             state.wpIndex = 1
@@ -1053,6 +1126,7 @@ local function patrolTick()
         local nextWp = wps[state.wpIndex]
         if nextWp then navTowardLoc(nextWp.x, nextWp.y, nextWp.z, radius) end
     else
+        state.wpArrivedIdx = nil
         navTowardLoc(wp.x, wp.y, wp.z, radius)
     end
     return true
@@ -1281,33 +1355,61 @@ local function currentAnchorLoc()
     return nil, 0 -- no camp set yet, or Hunt roaming unrestricted: nothing to anchor to
 end
 
-local function removeMapLocCircle()
-    if state.mapLocLoc then
-        mq.cmdf('/maploc remove %.2f %.2f %.2f', state.mapLocLoc.y, state.mapLocLoc.x, state.mapLocLoc.z)
-        state.mapLocLoc = nil
-        state.mapLocRadius = nil
+-- Two independent /maploc markers share this: the red pull/hunt radius
+-- (state.mapLoc*) and the green Camp Safe Radius (state.safeLoc*). Each is
+-- tracked by the exact y/x/z it was drawn at, since that's what /maploc
+-- remove matches on.
+local function removeLoc(locKey, radKey)
+    local cur = state[locKey]
+    if cur then
+        mq.cmdf('/maploc remove %.2f %.2f %.2f', cur.y, cur.x, cur.z)
+        state[locKey] = nil
+        state[radKey] = nil
     end
 end
 
+local function syncLoc(locKey, radKey, loc, radius, rgb, label)
+    if not loc or not radius or radius <= 0 then
+        removeLoc(locKey, radKey)
+        return
+    end
+    local cur = state[locKey]
+    local moved = not cur
+        or math.abs(cur.x - loc.x) > 0.5
+        or math.abs(cur.y - loc.y) > 0.5
+        or math.abs(cur.z - loc.z) > 0.5
+    if moved or state[radKey] ~= radius then
+        -- Anchor moved: the old marker would be orphaned at the old spot.
+        if cur and moved then removeLoc(locKey, radKey) end
+        mq.cmdf('/maploc %.2f %.2f %.2f size 10 color %s radius %d rcolor %s label %s',
+            loc.y, loc.x, loc.z, rgb, radius, rgb, label)
+        state[locKey] = { x = loc.x, y = loc.y, z = loc.z }
+        state[radKey] = radius
+    end
+end
+
+local function removeMapLocCircle()
+    removeLoc('mapLocLoc', 'mapLocRadius')
+    removeLoc('safeLocLoc', 'safeLocRadius')
+end
+
 local function syncMapCircle()
-    local loc, radius = currentAnchorLoc()
-    if not cfg.showMapCircle or not loc or radius <= 0 then
+    if not cfg.showMapCircle then
         removeMapLocCircle()
         return
     end
-    local moved = not state.mapLocLoc
-        or math.abs(state.mapLocLoc.x - loc.x) > 0.5
-        or math.abs(state.mapLocLoc.y - loc.y) > 0.5
-        or math.abs(state.mapLocLoc.z - loc.z) > 0.5
-    if moved or state.mapLocRadius ~= radius then
-        if state.mapLocLoc and moved then
-            -- Anchor moved: the old marker is now orphaned at the old spot.
-            mq.cmdf('/maploc remove %.2f %.2f %.2f', state.mapLocLoc.y, state.mapLocLoc.x, state.mapLocLoc.z)
-        end
-        mq.cmdf('/maploc %.2f %.2f %.2f size 10 radius %d rcolor 255 0 0 label Puller', loc.y, loc.x, loc.z, radius)
-        state.mapLocLoc = { x = loc.x, y = loc.y, z = loc.z }
-        state.mapLocRadius = radius
+    local loc, radius = currentAnchorLoc()
+    syncLoc('mapLocLoc', 'mapLocRadius', loc, radius, '255 0 0', 'Puller')
+    -- Green Camp Safe Radius, Camp mode only. Drawn 1 unit off the camp
+    -- point: /maploc matches an existing marker by its coordinates ("Updating
+    -- existing loc"), so a second marker at the exact same spot would just
+    -- overwrite the red one instead of adding a circle. 1 unit is invisible
+    -- at map scale.
+    local safeLoc = nil
+    if cfg.pullMode == 'Camp' and cfg.campLoc then
+        safeLoc = { x = cfg.campLoc.x, y = cfg.campLoc.y + 1, z = cfg.campLoc.z }
     end
+    syncLoc('safeLocLoc', 'safeLocRadius', safeLoc, cfg.campSafeRadius or 0, '0 255 0', 'Camp_Safe')
 end
 
 -- E3Next (the combat script onEngageCommand usually hands off to) exposes
@@ -1399,7 +1501,11 @@ local function enterFighting(id)
     if not id and state.pullState == 'GATHER' then state.pullTargetId = 0 end
     if id then state.pullTargetId = id end
     state.pullState = 'FIGHTING'
-    if id then announceEngage(id) end
+    -- Camp mode: an add that aggroed from out past the Camp Safe Radius
+    -- isn't handed to the combat script yet -- the FIGHTING block picks it
+    -- up (and fires onEngageCommand) once it walks into camp.
+    local announced = id and inCampSafeZone(id)
+    if announced then announceEngage(id) end
     -- Sync melee's own chase-switch tracker (FIGHTING block, below) to
     -- whatever's becoming the active target right now -- whether id was
     -- given here (it was just announced on the line above) or this is a
@@ -1415,7 +1521,7 @@ local function enterFighting(id)
     -- (the chase block owns onEngageCommand), so lastChaseId has to stay 0
     -- here or the chase block would think its first target was already
     -- handed off and never fire for it at all.
-    state.lastChaseId = id and state.pullTargetId or 0
+    state.lastChaseId = announced and state.pullTargetId or 0
     state.meleeChaseStuckSince = nil
 end
 
@@ -1438,6 +1544,8 @@ local function forceEngage()
     if mq.TLO.Target.ID() ~= id then mq.cmdf('/target id %d', id) end
     state.engagedIds = {}
     state.lastAnnounceAt = 0
+    -- "Fight this now" means now, wherever it is -- Camp Safe Radius or not.
+    state.campSafeBypassId = id
     enterFighting(id) -- also syncs lastChaseId to id
     printf('Forced engagement on #%d.', id)
 end
@@ -1462,6 +1570,7 @@ local function stopPulling()
     state.swarmSummoned = false
     state.swarmTagged = false
     state.swarmAggroSince = nil
+    state.campSafeBypassId = 0
 end
 
 -- Periodic console status line, gated behind cfg.debugEnabled (Settings tab
@@ -1939,6 +2048,11 @@ local function pullTick()
                         -- every cooldown window, never on what you were
                         -- actually hitting. Just mark it seen.
                         state.engagedIds[xid] = true
+                    elseif not inCampSafeZone(xid) then
+                        -- Camp mode, still outside the Camp Safe Radius:
+                        -- left unannounced so it's handed off once it
+                        -- actually reaches camp, not while it's still
+                        -- 100 units out pulling the fight away from camp.
                     elseif e3nEnabled and e3nSticking and xid == e3nMob then
                         -- E3Next's ClearXTargets already has this one targeted
                         -- and is actively stuck to it; nothing to announce,
@@ -1972,7 +2086,7 @@ local function pullTick()
         -- XTarget (an add) if the original died but the fight isn't over.
         if cfg.pullStyle == 'Melee' then
             local chaseId = state.pullTargetId
-            if chaseId <= 0 or not isHostileNpc(chaseId) then
+            if chaseId <= 0 or not isHostileNpc(chaseId) or not inCampSafeZone(chaseId) then
                 -- nearestHostileXtargetNotIgnored() first (the normal case,
                 -- skipping anything just abandoned as unreachable below --
                 -- otherwise a mob given up on seconds ago gets immediately
@@ -1980,8 +2094,14 @@ local function pullTick()
                 -- XTarget doesn't show anything, recentUnknownAttacker()
                 -- covers a mob that's genuinely hitting you but invisible
                 -- to XTarget (same gap this whole fallback chain exists for).
-                chaseId = nearestHostileXtargetNotIgnored() or recentUnknownAttacker()
-                if chaseId then state.pullTargetId = chaseId end
+                -- Camp mode: only mobs already inside the Camp Safe Radius
+                -- (inCampSafeZone is a no-op filter in Hunt mode).
+                chaseId = nearestHostileXtargetNotIgnored(inCampSafeZone)
+                if not chaseId then
+                    local unk = recentUnknownAttacker()
+                    if unk and inCampSafeZone(unk) then chaseId = unk end
+                end
+                state.pullTargetId = chaseId or 0
             end
             if chaseId and chaseId > 0 and isHostileNpc(chaseId) then
                 local tgtId = 0
@@ -2022,7 +2142,7 @@ local function pullTick()
                     -- instead of retrying the same stuck one forever.
                     state.meleeChaseStuckSince = state.meleeChaseStuckSince or os.clock()
                     if os.clock() - state.meleeChaseStuckSince > MELEE_CHASE_STUCK_SEC then
-                        local altId = nearestHostileXtargetExcept(chaseId)
+                        local altId = nearestHostileXtargetExcept(chaseId, inCampSafeZone)
                         if altId then
                             local nm = ''
                             pcall(function() nm = mq.TLO.Spawn(chaseId).CleanName() or '' end)
@@ -2063,6 +2183,12 @@ local function pullTick()
                         end
                     end
                 end
+            elseif cfg.pullMode == 'Camp' and cfg.campLoc then
+                -- Nothing inside the Camp Safe Radius yet (the rest are
+                -- still on their way in): hold at the camp point and let
+                -- them come, rather than running out to meet them.
+                local c = cfg.campLoc
+                navTowardLoc(c.x, c.y, c.z, 10)
             end
         end
         if not inCombat() then
@@ -2071,6 +2197,7 @@ local function pullTick()
             state.lastAnnounceAt = 0
             state.lastChaseId = 0
             state.meleeChaseStuckSince = nil
+            state.campSafeBypassId = 0
         end
         return
     end
@@ -2394,10 +2521,18 @@ local function drawGUI_()
             ImGui.Spacing()
 
             if cfg.pullMode == 'Camp' then
-                local r = preciseSlider('Pull Radius##campRadius', cfg.campRadius, 10, 300)
+                local r = preciseSlider('Pull Radius##campRadius', cfg.campRadius, 10, 1000)
                 if r ~= cfg.campRadius then cfg.campRadius = r; saveCfg() end
                 local z = preciseSlider('Pull Height Diff (Z)##campZ', cfg.campZ, 10, 300)
                 if z ~= cfg.campZ then cfg.campZ = z; saveCfg() end
+                local sr = preciseSlider('Camp Safe Radius (0 = off)##campSafeRadius', cfg.campSafeRadius or 30, 0, 200)
+                if sr ~= cfg.campSafeRadius then cfg.campSafeRadius = sr; saveCfg() end
+                if ImGui.IsItemHovered() then
+                    ImGui.SetTooltip('Once back at camp, mobs aren\'t engaged until they come within this\n' ..
+                        'distance of the camp point -- you hold at camp and let them come to you\n' ..
+                        'instead of running back out after the nearest one. Green circle on the\n' ..
+                        'EQ map. Force Engage ignores it.')
+                end
             else
                 local r = preciseSlider('Hunt Radius (0 = unrestricted)##huntRadius', cfg.huntRadius, 0, 1000)
                 if r ~= cfg.huntRadius then cfg.huntRadius = r; saveCfg() end
@@ -2458,7 +2593,7 @@ local function drawGUI_()
             if ImGui.Button('Add Waypoint Here') then
                 local x, y, z = mq.TLO.Me.X(), mq.TLO.Me.Y(), mq.TLO.Me.Z()
                 if x and y and z then
-                    table.insert(cfg.waypoints, { x = x, y = y, z = z, name = 'WP ' .. (#cfg.waypoints + 1) })
+                    table.insert(cfg.waypoints, { x = x, y = y, z = z, name = 'WP ' .. (#cfg.waypoints + 1), cmd = '', delay = 0 })
                     saveCfg()
                 end
             end
@@ -2466,6 +2601,7 @@ local function drawGUI_()
             if ImGui.Button('Clear Waypoints') then
                 cfg.waypoints = {}
                 state.wpIndex = 1
+                state.wpArrivedIdx = nil
                 saveCfg()
             end
 
@@ -2517,10 +2653,30 @@ local function drawGUI_()
                     if ImGui.SmallButton('Remove') then
                         table.remove(cfg.waypoints, i)
                         if state.wpIndex > #cfg.waypoints then state.wpIndex = 1 end
+                        state.wpArrivedIdx = nil -- indexes shifted
                         saveCfg()
                         ImGui.PopID()
                         break
                     end
+                    -- Second line: what to do on arrival. Both optional --
+                    -- blank command and 0 delay just walk straight through.
+                    ImGui.Indent(20)
+                    ImGui.SetNextItemWidth(160)
+                    local cmdV, cmdChanged = ImGui.InputText('Cmd##cmd', wp.cmd or '')
+                    if cmdChanged then wp.cmd = cmdV; saveCfg() end
+                    if ImGui.IsItemHovered() then
+                        ImGui.SetTooltip('Runs once when you arrive at this waypoint. Blank = nothing.\n' ..
+                            'For several commands: /multiline ; /cmd1;/cmd2')
+                    end
+                    ImGui.SameLine()
+                    local curDelay = tonumber(wp.delay) or 0
+                    local dl = preciseSlider('Delay (s)##delay', curDelay, 0, 120)
+                    if dl ~= curDelay then wp.delay = dl; saveCfg() end
+                    if ImGui.IsItemHovered() then
+                        ImGui.SetTooltip('Seconds to hold at this waypoint before moving on (0 = none).\n' ..
+                            'Still pulls anything that shows up while waiting.')
+                    end
+                    ImGui.Unindent(20)
                     ImGui.PopID()
                 end
             end
@@ -2728,12 +2884,12 @@ local function cmd_puller(sub, arg1)
     elseif sub == 'addwp' then
         local x, y, z = mq.TLO.Me.X(), mq.TLO.Me.Y(), mq.TLO.Me.Z()
         if x and y and z then
-            table.insert(cfg.waypoints, { x = x, y = y, z = z, name = 'WP ' .. (#cfg.waypoints + 1) })
+            table.insert(cfg.waypoints, { x = x, y = y, z = z, name = 'WP ' .. (#cfg.waypoints + 1), cmd = '', delay = 0 })
             saveCfg()
             printf('Waypoint %d added at current position.', #cfg.waypoints)
         end
     elseif sub == 'clearwp' then
-        cfg.waypoints = {}; state.wpIndex = 1; saveCfg()
+        cfg.waypoints = {}; state.wpIndex = 1; state.wpArrivedIdx = nil; saveCfg()
         printf('Waypoints cleared.')
     elseif sub == 'mode' then
         local m = arg1 and arg1:lower()
@@ -2823,6 +2979,8 @@ while running do
         -- syncMapCircle redraws here instead of assuming it's still shown.
         state.mapLocLoc = nil
         state.mapLocRadius = nil
+        state.safeLocLoc = nil
+        state.safeLocRadius = nil
         -- campLoc/huntAnchor are coordinates in the zone they were set in.
         -- Carrying on here would scan around (and, with Return to AP, walk
         -- toward) a meaningless spot in this zone, so pause instead.
