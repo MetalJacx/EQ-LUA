@@ -20,7 +20,7 @@ rewritten from scratch as its own script.
 
 Put `puller.lua` in your MacroQuest `lua/` folder, then run:
 
-```
+```text
 /lua run puller
 ```
 
@@ -31,7 +31,7 @@ the script.
 ## Commands
 
 | Command | What it does |
-|---|---|
+| --- | --- |
 | `/puller start` (or `resume`) | Start pulling |
 | `/puller stop` (or `pause`) | Stop pulling and cancel any movement in progress |
 | `/puller setcamp` | Set the camp to your current position and facing (Camp mode) |
@@ -64,6 +64,8 @@ once nothing hostile is left.
 
 ### Pull methods
 
+![Pull Method tab: pull style, On Engage Command and Wait for loot](docs/images/puller-pull-method.png)
+
 **Melee, Ranged, Spell or Item.** Puller moves into that method's range, tags the mob, and
 confirms aggro before dragging it home or fighting it in place.
 
@@ -86,11 +88,13 @@ On Engage Command runs whatever you put in it (for example `/assistme`) when a f
   seconds apart so they don't flood your combat script.
 - **Several commands** can go in one line with MacroQuest's `/multiline`:
 
-  ```
+  ```text
   /multiline ; /assistme;/hidecorpse all
   ```
 
 ### Targeting
+
+![Targeting tab: radius, height, Pull Wait, level and faction filters](docs/images/puller-targeting.png)
 
 - **Pull Radius / Hunt Radius and Height (Z):** how far out from your camp or anchor to look for
   mobs, and how far up or down. Both radii go up to 1000. In Hunt mode, a radius of **0 means the
@@ -123,6 +127,8 @@ Camp Safe Radius is a Camp mode setting with a default of 30 (0 turns it off).
 
 ### Pull arc
 
+![Pull Arc tab with the live direction preview](docs/images/puller-pull-arc.png)
+
 The pull arc works like KissAssist's `/setpullarc`: it limits pulls to a cone in one direction
 instead of the full circle.
 
@@ -131,6 +137,8 @@ instead of the full circle.
   from the camp or anchor location, so you can re-aim without standing on your camp spot again.
 
 ### Waypoint patrol
+
+![Waypoints tab](docs/images/puller-waypoints.png)
 
 A waypoint patrol is a list of saved points that Puller walks in order while there's nothing to
 pull. It can loop or go back and forth between the ends, and it scans for mobs along the way.
@@ -144,6 +152,8 @@ Each waypoint has two optional settings:
   no wait. Puller still pulls anything that shows up while it's waiting.
 
 ### Swarm Pull
+
+![Swarm Pull tab](docs/images/puller-swarm-pull.png)
 
 Swarm Pull gathers a set number of mobs onto XTarget **before** the fight starts, instead of
 tagging and fighting one mob at a time.
@@ -159,7 +169,24 @@ tagging and fighting one mob at a time.
 - **Works in either mode:** Hunt fights the whole group in place. Camp drags the whole group
   home.
 
+### Wait for loot
+
+Wait for loot is off by default and lives at the bottom of the Pull Method tab. After a fight, Puller holds off on
+the next pull, on Return to AP, and on sitting while something is looting: E3 autoloot, another
+script, or you. It works by watching the game's loot window, because E3Next doesn't expose a
+"looting" state.
+
+- **Before looting starts:** if NPC corpses are within **Corpse Radius** (default 50, 20 up or
+  down, the same as E3's corpse search), it waits up to **Start Wait** (default 4 s) for looting
+  to begin.
+- **During looting:** it holds while the loot window is open, and for **Between Corpses**
+  (default 5 s) after each close, while the looter moves to the next corpse.
+- **Limits:** **Max Wait** (default 180 s) caps a single wait. Anything attacking you ends the
+  wait immediately.
+
 ### Priority Kill List
+
+![Priority / Ignore tab](docs/images/puller-priority-ignore.png)
 
 The Priority Kill List is for rare or named mobs that should be pulled ahead of whatever happens
 to be closer. Lists are saved **per zone**.
@@ -167,7 +194,20 @@ to be closer. Lists are saved **per zone**.
 A priority mob still has to pass your level, faction, radius and arc filters. Being on the list
 only means it wins the pick when it's up and eligible.
 
+- **Only pull priority mobs:** with the list enabled, Puller never picks anything that isn't on
+  this zone's list. If nothing on the list is up, or the list is empty, nothing gets pulled. Mobs
+  that aggro on their own are still fought.
+
+### Ignore list
+
+The Ignore list is on the same Priority / Ignore tab and is also saved per zone. Names on it are
+never chosen as pull targets. It only affects pulling: if an ignored mob aggroes anyway (an add,
+proximity aggro, or a Swarm Pull drag), it's fought like anything else. If a name is on both
+lists, Ignore wins.
+
 ### Resource Gate
+
+![Resource Gate tab](docs/images/puller-resource-gate.png)
 
 The Resource Gate stops new pulls when HP, Mana or Endurance (whichever you turn on) is at or
 below a "start" percentage. Pulling resumes once that resource is back above a higher "stop"
