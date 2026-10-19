@@ -14,7 +14,8 @@ rewritten from scratch as its own script.
 - [MQ2Nav](https://www.macroquest.org/), with a navmesh loaded for your current zone. Pulling,
   dragging mobs home, and choosing which mob is closest all depend on it.
 - Optional: a combat script or boxing framework to hand fights off to, through the
-  **On Engage Command** setting.
+  **On Engage Command** setting. See
+  [Using Puller with a combat script](#using-puller-with-a-combat-script).
 
 ## Installation
 
@@ -86,6 +87,8 @@ On Engage Command runs whatever you put in it (for example `/assistme`) when a f
   you're actually hitting.
 - **With other pull methods**, it runs once for each new mob on XTarget. Runs are spaced a few
   seconds apart so they don't flood your combat script.
+- **Setup per script:** see [Using Puller with a combat script](#using-puller-with-a-combat-script)
+  for E3Next, triune.lua and KissAssist.
 - **Several commands** can go in one line with MacroQuest's `/multiline`:
 
   ```text
@@ -233,6 +236,64 @@ percentage. You sit to recover in between.
   the mob it's after, distance, line of sight, combat flags, XTarget and swarm counts, the
   anchor, radius and arc in use, and your HP. Use it to see why Puller is or isn't doing
   something.
+
+## Using Puller with a combat script
+
+Puller finds mobs and gets you into the fight. Your combat script runs the rotation. The handoff
+is the **On Engage Command** box: Puller runs whatever you put there exactly as typed, and
+`/multiline` lets you send several commands at once. Some scripts don't need a command at all,
+because they start fighting on their own once you're in combat.
+
+**The one rule for any script: only one thing should move you during a fight.**
+
+- **Pull style Melee:** Puller keeps targeting, walking you to mobs and facing them for the
+  whole fight. Turn off your combat script's own chase, stick and follow on the puller
+  character.
+- **Ranged, Spell or Item:** Puller stops controlling you once the fight starts, so your combat
+  script can move you.
+- **Pulling:** never run your combat script in a pulling or hunting role at the same time as
+  Puller. Both would try to pick targets and move you.
+
+### E3Next
+
+- **On Engage Command:** `/assistme` sends your E3 bots to assist on your current target. With
+  Melee it runs each time your target changes, so the group stays on the mob you're hitting.
+  Example with an extra command:
+
+  ```text
+  /multiline ; /assistme;/hidecorpse all
+  ```
+
+- **ClearXTargets instead:** you can use `/cleartargets stick` (or similar) instead. With
+  Ranged, Spell or Item, Puller reads E3's ClearXTargets state and won't announce a mob that E3
+  is already stuck to.
+- **Puller character:** make sure it isn't set to follow or chase another character in E3.
+- **Autoloot:** if E3 autoloot is on, turn on **Wait for loot** so Puller doesn't pull you away
+  from the corpses.
+
+### triune.lua (with tac)
+
+- **Mode:** run triune in **Manual** mode (`/ac manual`). In that mode it fights mobs that are
+  attacking you or your pet, plus XTarget mobs engaged with your side within its chase range,
+  so On Engage can stay blank. (`tac` is triune's add-on suite of HUDs, loot and similar. The
+  rotation itself is in `triune.lua`.)
+- **With Melee:** turn off triune's own sticking with `/ac manualstick off` so it doesn't chase
+  mobs while Puller is moving you. Leave `/ac manualnav` off (its default).
+- **Don't use triune's Puller or Assist modes** alongside Puller.
+- **Group:** you can still put `/assistme` or another group command in On Engage for your
+  other characters.
+
+### KissAssist
+
+- **Role:** run KissAssist in **Manual** role. You control movement and targeting, and
+  KissAssist handles abilities, discs, heals and buffs on your current target once you're
+  fighting. Puller's Melee style already turns auto-attack on, so On Engage can be blank, or
+  `/attack on` to be sure.
+- **Avoid** the Puller, PullerTank and Hunter roles, because they pick targets and move you.
+- **Tank role** can work in Camp mode, but only if KissAssist's camp matches Puller's and its
+  return-to-camp and chase settings are off. Otherwise it pulls you back to its own camp spot.
+- Role names and settings differ between KissAssist versions, so check your version's
+  documentation.
 
 ## Out of scope
 
