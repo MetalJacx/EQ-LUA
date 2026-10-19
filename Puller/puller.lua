@@ -218,6 +218,20 @@ local function defaultCfg()
         -- still out gathering more.
         swarmHpAbortEnabled = true,
         swarmHpAbortPct = 60,
+        -- Wait for loot: after a fight, hold off on the next pull (and on
+        -- Return to AP / sitting) while something -- E3 autoloot, another
+        -- script, or you -- is looting. E3Next exposes no "looting" state
+        -- (checked E3NextMC Loot.cs: nothing is [ExposedData]), so this
+        -- keys off what the game itself shows: the LootWnd being open.
+        -- Defaults match E3's autoloot timing: it starts ~2s after a fight
+        -- (Loot_TimeToWaitAfterAssist) on a 1s check, and spends up to ~4s
+        -- between corpses (walk up to 2.25s + up to 1.5s for LootWnd).
+        lootWaitEnabled = false,
+        lootStartGrace = 4,     -- sec after a fight for looting to begin (only if corpses are nearby)
+        lootGapGrace = 5,       -- sec after LootWnd closes before calling looting done
+        lootCorpseRadius = 50,  -- "corpses nearby" radius (E3's Loot_CorpseSeekRadius default)
+        lootMaxWait = 180,      -- hard cap on one wait (a loot window left open); 20+ corpses at
+                                -- ~4s each needs well over a minute, so keep this generous
         -- Prints a periodic status line (state, chase target, distance/LOS,
         -- XTarget/swarm counts, combat flags, HP%) to the console every few
         -- seconds -- for diagnosing "why isn't it doing anything" live
@@ -303,6 +317,8 @@ local state = {
                                  -- to be "arrived" at (nil once arrived or chaseId changes)
     lastDebugAt = 0,       -- os.clock() of the last debug status print
     priorityInput = '',    -- scratch text for the Priority List tab's Add box
+    lootWaitSince = nil,   -- os.clock() the current post-fight loot wait began, nil = not waiting
+    lootSeenAt = nil,      -- os.clock() LootWnd was last seen open during this wait
 }
 
 local openGUI, drawGUI = true, true
@@ -1571,6 +1587,7 @@ local function stopPulling()
     state.swarmTagged = false
     state.swarmAggroSince = nil
     state.campSafeBypassId = 0
+    state.lootWaitSince = nil
 end
 
 -- Periodic console status line, gated behind cfg.debugEnabled (Settings tab
@@ -1619,6 +1636,53 @@ local function printDebugStatus()
     printf('DEBUG enabled=%s resting=%s mode=%s %s state=%s target=#%d(%s) dist=%.0f los=%s combat=%s autofire=%s xtHostiles=%d%s hp=%d%%',
         tostring(cfg.enabled), tostring(state.resting), cfg.pullMode, anchorInfo, state.pullState, tgtId, tgtName, tgtDist, tgtLos,
         tostring(combat), tostring(autofire), xtHostiles, swarmInfo, math.floor(mq.TLO.Me.PctHPs() or 0))
+end
+
+-- Starts a post-fight loot wait (no-op unless Wait for loot is on).
+local function beginLootWait()
+    if not cfg.lootWaitEnabled then return end
+    state.lootWaitSince = os.clock()
+    state.lootSeenAt = nil
+end
+
+-- True while IDLE should hold for looting. Phases, in order:
+--   1. LootWnd open -> looting right now.
+--   2. Seen open this wait and closed less than lootGapGrace ago -> the
+--      looter is on its way to the next corpse.
+--   3. Nothing seen yet, still inside lootStartGrace, and NPC corpses are
+--      nearby -> give the looter its chance to start (E3 waits ~2s after a
+--      fight). With no corpses in range there's nothing to wait for.
+-- lootMaxWait caps the whole thing. The radius/height match E3's own
+-- corpse search (Loot_CorpseSeekRadius 50, Z within 20).
+local function lootWaitActive()
+    if not cfg.lootWaitEnabled or not state.lootWaitSince then return false end
+    local now = os.clock()
+    local elapsed = now - state.lootWaitSince
+    local open = false
+    pcall(function() open = mq.TLO.Window('LootWnd').Open() == true end)
+    if open then state.lootSeenAt = now end
+
+    local hold = false
+    if elapsed < (cfg.lootMaxWait or 180) then
+        if open then
+            hold = true
+        elseif state.lootSeenAt then
+            hold = (now - state.lootSeenAt) < (cfg.lootGapGrace or 5)
+        elseif elapsed < (cfg.lootStartGrace or 4) then
+            local corpses = 0
+            pcall(function()
+                corpses = mq.TLO.SpawnCount(string.format('npccorpse radius %d zradius 20',
+                    cfg.lootCorpseRadius or 50))() or 0
+            end)
+            hold = corpses > 0
+        end
+    end
+    if not hold then
+        if state.lootSeenAt then printf('Looting finished -- resuming pulls.') end
+        state.lootWaitSince = nil
+        state.lootSeenAt = nil
+    end
+    return hold
 end
 
 -- ----------------------------------------------------------------------------
@@ -1670,6 +1734,7 @@ local function pullTick()
             addId = recentUnknownAttacker()
         end
         if addId then
+            state.lootWaitSince = nil -- being attacked ends any loot wait
             if isSittingOrDucking() then mq.cmd('/stand') end
             state.engagedIds = {}
             state.lastAnnounceAt = 0
@@ -1679,6 +1744,10 @@ local function pullTick()
         -- Fix: a full combat check, not bare Me.Combat() -- Ranged/Spell/Item
         -- pulls can be mid-fight with no melee swing up.
         if inCombat() then return end
+
+        -- Wait for loot: hold everything below (next pull, patrol, Return
+        -- to AP, sitting) while a looter is working through the corpses.
+        if lootWaitActive() then return end
 
         -- lastScanAt only advances on an EMPTY scan: pullWait is meant to
         -- throttle "still nothing up" re-checks, not to delay the next pick
@@ -1978,6 +2047,7 @@ local function pullTick()
             -- drop you straight back to IDLE mid-fight.
             if countSwarmHaters() == 0 and not recentUnknownAttacker() then
                 state.pullState = 'IDLE'; state.pullTargetId = 0
+                beginLootWait()
                 return
             end
         else
@@ -2198,6 +2268,7 @@ local function pullTick()
             state.lastChaseId = 0
             state.meleeChaseStuckSince = nil
             state.campSafeBypassId = 0
+            beginLootWait()
         end
         return
     end
@@ -2212,6 +2283,8 @@ local function statusLine()
     local stateLabel = state.pullState
     if stateLabel == 'GATHER' then
         stateLabel = string.format('GATHER (%d/%d)', countSwarmHaters(), cfg.swarmCount or 1)
+    elseif stateLabel == 'IDLE' and state.lootWaitSince then
+        stateLabel = 'IDLE (loot wait)'
     end
     return string.format('%s %s | target: %s | %s: %s | %s',
         cfg.pullMode, stateLabel,
@@ -2511,6 +2584,42 @@ local function drawGUI_()
             if oeChanged then cfg.onEngageCommand = oe; saveCfg() end
             if ImGui.IsItemHovered() then
                 ImGui.SetTooltip('Runs once, the instant the fight actually begins (Camp or Hunt).\nFor handing off to a combat script, e.g. /cleartargets stick.\nLeave blank to do nothing.')
+            end
+            ImGui.Spacing()
+            ImGui.Separator()
+            ImGui.Text('Wait for loot')
+            ImGui.TextDisabled('After a fight, waits for looting (E3 autoloot, another script, or you)')
+            ImGui.TextDisabled('to finish before the next pull -- detected from the loot window.')
+
+            local le = ImGui.Checkbox('Enabled##lootWaitEnabled', cfg.lootWaitEnabled)
+            if le ~= cfg.lootWaitEnabled then cfg.lootWaitEnabled = le; saveCfg() end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Holds the next pull, Return to AP and sitting while the loot window is\n' ..
+                    'open or was open a moment ago. Anything attacking you ends the wait.')
+            end
+            local cr = preciseSlider('Corpse Radius##lootCorpseRadius', cfg.lootCorpseRadius or 50, 10, 200)
+            if cr ~= cfg.lootCorpseRadius then cfg.lootCorpseRadius = cr; saveCfg() end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Only waits for looting to start if NPC corpses are within this distance\n' ..
+                    '(and 20 up/down). Match E3\'s Loot Corpse Seek Radius (default 50).')
+            end
+            local sg = preciseSlider('Start Wait (s)##lootStartGrace', cfg.lootStartGrace or 4, 0, 15)
+            if sg ~= cfg.lootStartGrace then cfg.lootStartGrace = sg; saveCfg() end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('How long after a fight to give the looter a chance to start.\n' ..
+                    'E3 autoloot starts about 2-3 seconds after combat ends.')
+            end
+            local gg = preciseSlider('Between Corpses (s)##lootGapGrace', cfg.lootGapGrace or 5, 1, 15)
+            if gg ~= cfg.lootGapGrace then cfg.lootGapGrace = gg; saveCfg() end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('How long the loot window can stay closed before looting counts as done\n' ..
+                    '(time to walk to the next corpse and open it).')
+            end
+            local mw = preciseSlider('Max Wait (s)##lootMaxWait', cfg.lootMaxWait or 180, 10, 600)
+            if mw ~= cfg.lootMaxWait then cfg.lootMaxWait = mw; saveCfg() end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Longest a single wait can last, no matter what -- a backstop for a loot\n' ..
+                    'window left open. A big swarm (20+ corpses) can take well over a minute.')
             end
             ImGui.EndTabItem()
         end
@@ -2981,6 +3090,7 @@ while running do
         state.mapLocRadius = nil
         state.safeLocLoc = nil
         state.safeLocRadius = nil
+        state.lootWaitSince = nil
         -- campLoc/huntAnchor are coordinates in the zone they were set in.
         -- Carrying on here would scan around (and, with Return to AP, walk
         -- toward) a meaningless spot in this zone, so pause instead.
