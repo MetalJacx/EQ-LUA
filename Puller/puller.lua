@@ -81,9 +81,9 @@
     stall timeout, not a full stuck-recovery state machine.
 
     Usage: /lua run puller
-    Commands: /puller start|stop|resume|pause|setcamp|clearcamp|addwp|
-              clearwp|mode camp|mode hunt|status|force
-              /pullerexit (also stop/quit) exits the script.
+    Commands: /puller help lists them all (start, stop, mode, setcamp,
+              setanchor, radius, style, engage, swarm, lootwait, priority,
+              ignore, show/hide, ...). /pullerexit exits the script.
 --]]
 
 local mq = require('mq')
@@ -2538,6 +2538,9 @@ local function drawZoneNameList(listsKey, idp, inputKey, emptyText)
 end
 
 local function drawGUI_()
+    -- Closed with the X (or /puller hide): skip drawing entirely until
+    -- /puller show (or toggle) turns it back on.
+    if not openGUI then return end
     openGUI, drawGUI = ImGui.Begin('Puller##' .. myName, openGUI)
     if drawGUI then
         local scR, scG, scB, scA = statusColor()
@@ -3021,8 +3024,102 @@ end
 -- ----------------------------------------------------------------------------
 -- Commands + main loop
 -- ----------------------------------------------------------------------------
-local function cmd_puller(sub, arg1)
-    sub = sub and sub:lower() or 'help'
+-- on/off/toggle argument: 'on'/'1'/'true' -> true, 'off'/'0'/'false' ->
+-- false, nothing -> flip the current value. nil for anything else.
+local function parseOnOff(arg, current)
+    if arg == nil or arg == '' then return not current end
+    arg = arg:lower()
+    if arg == 'on' or arg == '1' or arg == 'true' or arg == 'yes' then return true end
+    if arg == 'off' or arg == '0' or arg == 'false' or arg == 'no' then return false end
+    return nil
+end
+
+-- Shared by the simple on/off commands (swarm, lootwait, debug, priority,
+-- priorityonly): sets cfg[key], saves, and reports it.
+local function setToggle(key, label, arg)
+    local v = parseOnOff(arg, cfg[key])
+    if v == nil then
+        printf('Usage: on|off (or nothing to toggle). %s is %s.', label, cfg[key] and 'on' or 'off')
+        return
+    end
+    cfg[key] = v
+    saveCfg()
+    printf('%s %s.', label, v and 'on' or 'off')
+end
+
+-- Name argument for the list commands: everything after the action, or the
+-- current target's name when nothing was given.
+local function nameOrTarget(rest)
+    if rest and rest ~= '' then return rest end
+    local tName, tType = nil, nil
+    pcall(function() tName = mq.TLO.Target.CleanName(); tType = mq.TLO.Target.Type() end)
+    if tName and tName ~= '' and tType == 'NPC' then return tName end
+    return nil
+end
+
+local function removeZoneName(listsKey, name)
+    local zs = currentZoneShortName()
+    local list = zs ~= '' and cfg[listsKey][zs] or nil
+    if type(list) ~= 'table' then return false end
+    for i, n in ipairs(list) do
+        if tostring(n):lower() == name:lower() then
+            table.remove(list, i)
+            saveCfg()
+            return true
+        end
+    end
+    return false
+end
+
+-- /puller priority add|remove [name] and /puller ignore add|remove [name].
+local function listCommand(listsKey, label, action, rest)
+    if action ~= 'add' and action ~= 'remove' then
+        local zs = currentZoneShortName()
+        local list = zs ~= '' and cfg[listsKey][zs] or nil
+        local names = (type(list) == 'table' and #list > 0) and table.concat(list, ', ') or '(none)'
+        printf('%s list for %s: %s', label, zs ~= '' and zs or '?', names)
+        return
+    end
+    local name = nameOrTarget(rest)
+    if not name then
+        printf('Give a name or target an NPC: /puller %s %s <name>', label:lower(), action)
+        return
+    end
+    if action == 'add' then
+        if addZoneName(listsKey, name) then printf('Added "%s" to the %s list.', name, label) end
+    elseif removeZoneName(listsKey, name) then
+        printf('Removed "%s" from the %s list.', name, label)
+    else
+        printf('"%s" is not on this zone\'s %s list.', name, label)
+    end
+end
+
+local function printHelp()
+    printf('Commands (/puller ...):')
+    printf('  start | stop -- start/stop pulling      status -- print the current state')
+    printf('  mode camp|hunt -- switch Pull Mode       force -- fight your current target now')
+    printf('  setcamp | clearcamp -- camp spot         setanchor | clearanchor -- hunt anchor')
+    printf('  addwp | clearwp -- waypoints             radius <n> -- pull/hunt radius')
+    printf('  style melee|ranged|spell|item            engage <command> | engage clear')
+    printf('  swarm on|off | swarm count <n>           lootwait on|off       debug on|off')
+    printf('  priority on|off | priorityonly on|off')
+    printf('  priority add|remove [name]  ignore add|remove [name]  (no name = your target)')
+    printf('  show | hide | toggle -- the Puller window')
+    printf('/pullerexit -- exit the script')
+end
+
+local function cmd_puller(...)
+    local args = { ... }
+    local sub = args[1] and args[1]:lower() or 'help'
+    local arg1 = args[2]
+    -- Everything after the first N words, rejoined -- mob names and the
+    -- On Engage Command contain spaces.
+    local function restFrom(n)
+        local parts = {}
+        for i = n, #args do parts[#parts + 1] = args[i] end
+        return table.concat(parts, ' ')
+    end
+
     if sub == 'start' or sub == 'resume' then
         cfg.enabled = true; saveCfg()
         printf('Pulling started.')
@@ -3041,6 +3138,18 @@ local function cmd_puller(sub, arg1)
     elseif sub == 'clearcamp' then
         cfg.campLoc = nil; saveCfg()
         printf('Camp cleared.')
+    elseif sub == 'setanchor' then
+        local x, y, z = mq.TLO.Me.X(), mq.TLO.Me.Y(), mq.TLO.Me.Z()
+        if x and y and z then
+            cfg.huntAnchor = { x = x, y = y, z = z, zone = currentZoneShortName() }
+            cfg.huntHeading = mq.TLO.Me.Heading.Degrees()
+            state.arcAiming.Hunt = false
+            saveCfg()
+            printf('Hunt anchor set to current position.')
+        end
+    elseif sub == 'clearanchor' then
+        cfg.huntAnchor = nil; saveCfg()
+        printf('Hunt anchor cleared (roaming unrestricted).')
     elseif sub == 'addwp' then
         local x, y, z = mq.TLO.Me.X(), mq.TLO.Me.Y(), mq.TLO.Me.Z()
         if x and y and z then
@@ -3060,12 +3169,80 @@ local function cmd_puller(sub, arg1)
         else
             printf('Usage: /puller mode camp|hunt (current: %s)', cfg.pullMode)
         end
+    elseif sub == 'radius' then
+        -- Same ranges as the Targeting tab sliders: Camp 10-1000, Hunt 0-1000
+        -- (0 = whole zone).
+        local n = tonumber(arg1)
+        local isCamp = cfg.pullMode == 'Camp'
+        if not n then
+            printf('Usage: /puller radius <n> (current %s radius: %d)', cfg.pullMode,
+                isCamp and (cfg.campRadius or 0) or (cfg.huntRadius or 0))
+        else
+            n = math.floor(math.max(isCamp and 10 or 0, math.min(1000, n)))
+            if isCamp then cfg.campRadius = n else cfg.huntRadius = n end
+            saveCfg()
+            printf('%s radius set to %d%s.', cfg.pullMode, n, (not isCamp and n == 0) and ' (whole zone)' or '')
+        end
+    elseif sub == 'style' then
+        local want = arg1 and arg1:lower()
+        local found = nil
+        for _, st in ipairs(PULL_STYLES) do
+            if st:lower() == want then found = st end
+        end
+        if found then
+            cfg.pullStyle = found; saveCfg()
+            printf('Pull style: %s.', found)
+        else
+            printf('Usage: /puller style melee|ranged|spell|item (current: %s)', cfg.pullStyle)
+        end
+    elseif sub == 'engage' then
+        local text = restFrom(2)
+        if text == '' then
+            printf('On Engage Command: %s', cfg.onEngageCommand ~= '' and cfg.onEngageCommand or '(blank)')
+        else
+            cfg.onEngageCommand = (text:lower() == 'clear') and '' or text
+            saveCfg()
+            printf('On Engage Command: %s', cfg.onEngageCommand ~= '' and cfg.onEngageCommand or '(blank)')
+        end
+    elseif sub == 'swarm' then
+        if arg1 and arg1:lower() == 'count' then
+            local n = tonumber(args[3])
+            if n then
+                cfg.swarmCount = math.floor(math.max(1, math.min(20, n))); saveCfg()
+                printf('Swarm Pull count: %d.', cfg.swarmCount)
+            else
+                printf('Usage: /puller swarm count <1-20> (current: %d)', cfg.swarmCount or 1)
+            end
+        else
+            setToggle('swarmEnabled', 'Swarm Pull', arg1)
+        end
+    elseif sub == 'lootwait' then
+        setToggle('lootWaitEnabled', 'Wait for loot', arg1)
+    elseif sub == 'debug' then
+        setToggle('debugEnabled', 'Debug', arg1)
+    elseif sub == 'priority' then
+        local action = arg1 and arg1:lower()
+        if action == 'add' or action == 'remove' or action == 'list' then
+            listCommand('priorityLists', 'Priority', action, restFrom(3))
+        else
+            setToggle('priorityEnabled', 'Priority list', arg1)
+        end
+    elseif sub == 'priorityonly' then
+        setToggle('priorityOnly', 'Only pull priority mobs', arg1)
+    elseif sub == 'ignore' then
+        listCommand('ignoreLists', 'Ignore', arg1 and arg1:lower(), restFrom(3))
+    elseif sub == 'show' then
+        openGUI = true
+    elseif sub == 'hide' then
+        openGUI = false
+    elseif sub == 'toggle' then
+        openGUI = not openGUI
     elseif sub == 'status' then
         printf('%s', statusLine())
     elseif sub == 'force' or sub == 'forceengage' then
         forceEngage()
     else
-        printf('/puller start|stop|setcamp|clearcamp|addwp|clearwp|mode camp|mode hunt|status|force')
+        printHelp()
     end
 end
 

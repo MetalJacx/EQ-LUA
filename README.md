@@ -35,16 +35,36 @@ the script.
 | --- | --- |
 | `/puller start` (or `resume`) | Start pulling |
 | `/puller stop` (or `pause`) | Stop pulling and cancel any movement in progress |
-| `/puller setcamp` | Set the camp to your current position and facing (Camp mode) |
-| `/puller clearcamp` | Clear the camp location |
-| `/puller addwp` | Add a waypoint at your current position |
-| `/puller clearwp` | Clear all waypoints |
-| `/puller mode camp` / `/puller mode hunt` | Switch Pull Mode |
 | `/puller status` | Print the current state to the console |
+| `/puller help` | List all commands in the console |
+| `/puller mode camp` / `/puller mode hunt` | Switch Pull Mode |
+| `/puller setcamp` / `/puller clearcamp` | Set the camp to your position and facing, or clear it |
+| `/puller setanchor` / `/puller clearanchor` | Set the Hunt anchor to your position and facing, or clear it (roam unrestricted) |
+| `/puller radius <n>` | Set the Pull Radius (Camp, 10-1000) or Hunt Radius (0-1000, 0 = whole zone) for the current mode |
+| `/puller style melee\|ranged\|spell\|item` | Set the pull method |
+| `/puller engage <command>` | Set the On Engage Command (`engage clear` blanks it, `engage` alone shows it) |
+| `/puller addwp` / `/puller clearwp` | Add a waypoint at your position, or clear all waypoints |
+| `/puller swarm on\|off` | Turn Swarm Pull on or off |
+| `/puller swarm count <n>` | Set the Swarm Pull count (1-20) |
+| `/puller lootwait on\|off` | Turn Wait for loot on or off |
+| `/puller debug on\|off` | Turn Debug mode on or off |
+| `/puller priority on\|off` | Turn the Priority Kill List on or off |
+| `/puller priorityonly on\|off` | Turn "Only pull priority mobs" on or off |
+| `/puller priority add\|remove [name]` | Add or remove a name on this zone's priority list |
+| `/puller ignore add\|remove [name]` | Add or remove a name on this zone's Ignore list |
+| `/puller priority list` / `/puller ignore` | Print this zone's list |
+| `/puller show` / `hide` / `toggle` | Show or hide the Puller window (brings it back after closing it with the X) |
 | `/puller force` (or `forceengage`) | Start fighting your current target immediately |
 | `/pullerexit` | Exit the script |
 
-Every command also has a button or control in the UI window.
+Notes:
+
+- **On/off commands:** leaving off `on`/`off` flips the setting.
+- **List commands:** with no name, `add` and `remove` use your current target, which makes
+  `/puller ignore add` a quick hotkey for skipping a mob. Names can contain spaces, for example
+  `/puller priority add an eerie chest`.
+
+Most of these also have a button or control in the UI window.
 
 ## How it works
 
