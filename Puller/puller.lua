@@ -247,6 +247,15 @@ local function defaultCfg()
         -- across the zone after it.
         priorityEnabled = false,
         priorityLists = {},    -- zoneShortName -> { 'clean name', ... }
+        -- Only pull priority mobs: with the Priority List enabled, nothing
+        -- that isn't on this zone's list is ever picked as a pull (an empty
+        -- list means nothing gets pulled). Mobs that aggro on their own are
+        -- still fought as usual.
+        priorityOnly = false,
+        -- Ignore list: per-zone names never picked as a pull target. Purely
+        -- a pull filter -- if one aggros anyway (an add, proximity, a swarm
+        -- drag) it's fought like anything else.
+        ignoreLists = {},      -- zoneShortName -> { 'clean name', ... }
     }
 end
 
@@ -257,6 +266,7 @@ do
         for k, v in pairs(data) do cfg[k] = v end
         if type(cfg.conFilter) ~= 'table' then cfg.conFilter = defaultConFilter() end
         if type(cfg.priorityLists) ~= 'table' then cfg.priorityLists = {} end
+        if type(cfg.ignoreLists) ~= 'table' then cfg.ignoreLists = {} end
         -- A saved Min > Max (possible before the UI clamp existed) would
         -- otherwise display that way forever even though findPullTarget()
         -- now tolerates it -- fix the stored values too, not just the
@@ -317,6 +327,7 @@ local state = {
                                  -- to be "arrived" at (nil once arrived or chaseId changes)
     lastDebugAt = 0,       -- os.clock() of the last debug status print
     priorityInput = '',    -- scratch text for the Priority List tab's Add box
+    ignoreInput = '',      -- same, for the Ignore list's Add box
     lootWaitSince = nil,   -- os.clock() the current post-fight loot wait began, nil = not waiting
     lootSeenAt = nil,      -- os.clock() LootWnd was last seen open during this wait
 }
@@ -952,9 +963,8 @@ local function currentZoneShortName()
     pcall(function() zs = mq.TLO.Zone.ShortName() or '' end)
     return zs
 end
-
--- Read-only: the current zone's list, or nil if it has none / the feature's
--- namesoff. Callers that need to MUTATE the list use ensurePriorityList.
+-- Read-only: the current zone's priority list, or nil if it has none or the
+-- feature is off. Callers that need to MUTATE a list use ensureZoneList.
 local function currentPriorityList()
     if not cfg.priorityEnabled then return nil end
     local zs = currentZoneShortName()
@@ -964,14 +974,25 @@ local function currentPriorityList()
     return list
 end
 
--- Creates the current zone's list on first use (Add button), independent
--- of cfg.priorityEnabled -- you should be able to build a list for a zone
--- before switching the feature on.
-local function ensurePriorityList()
+-- Creates the current zone's list in cfg[listsKey] ('priorityLists' or
+-- 'ignoreLists') on first use (Add button), independent of whether the
+-- feature is switched on -- you should be able to build a list for a zone
+-- before turning it on.
+local function ensureZoneList(listsKey)
     local zs = currentZoneShortName()
     if zs == '' then return nil end
-    if type(cfg.priorityLists[zs]) ~= 'table' then cfg.priorityLists[zs] = {} end
-    return cfg.priorityLists[zs]
+    if type(cfg[listsKey][zs]) ~= 'table' then cfg[listsKey][zs] = {} end
+    return cfg[listsKey][zs]
+end
+
+-- Lower-cased set of the current zone's Ignore list, or nil if it has none.
+local function currentIgnoreSet()
+    local zs = currentZoneShortName()
+    local list = zs ~= '' and cfg.ignoreLists[zs] or nil
+    if type(list) ~= 'table' or #list == 0 then return nil end
+    local set = {}
+    for _, n in ipairs(list) do set[tostring(n):lower()] = true end
+    return set
 end
 
 local function isPriorityName(cleanName)
@@ -1035,6 +1056,10 @@ local function findPullTarget(extraExclude)
     -- below same as anything else; this only changes which one gets picked.
     local bestPriorityId, bestPriorityDist = nil, math.huge
     local hasPriority = currentPriorityList() ~= nil
+    -- Only pull priority mobs: an empty/missing list means nothing to pull.
+    local priorityOnly = cfg.priorityEnabled and cfg.priorityOnly
+    if priorityOnly and not hasPriority then return nil end
+    local ignoreSet = currentIgnoreSet()
     local useNav = navLoaded()
     for i = 1, 60 do
         local s = mq.TLO.NearestSpawn(i, p)
@@ -1059,6 +1084,10 @@ local function findPullTarget(extraExclude)
                 end
                 if inAnchor then
                     local cname = s.CleanName()
+                    -- Ignore list / priority-only are pull filters only,
+                    -- checked before the (costly) path length below.
+                    if ignoreSet and cname and ignoreSet[cname:lower()] then goto continue end
+                    if priorityOnly and not isPriorityName(cname) then goto continue end
                     local tier = cname and state.conCache[cname]
                     if not tier or cfg.conFilter[tier] ~= false then
                         local ddx, ddy, ddz = sx - mx, sy - my, sz - mz
@@ -1091,6 +1120,7 @@ local function findPullTarget(extraExclude)
         end
         ::continue::
     end
+    if priorityOnly then return bestPriorityId end
     return bestPriorityId or bestId
 end
 
@@ -2453,6 +2483,60 @@ local function drawArcTab()
     end
 end
 
+-- Add-by-name box, "Add Current Target" button and per-zone list with
+-- Remove buttons -- shared by the Priority and Ignore lists. idp keeps the
+-- ImGui ids of the two copies apart; inputKey is the state field holding
+-- that copy's text box contents.
+local function addZoneName(listsKey, name)
+    name = tostring(name or ''):gsub('^%s+', ''):gsub('%s+$', '')
+    if name == '' then return false end
+    local list = ensureZoneList(listsKey)
+    if not list then return false end
+    for _, n in ipairs(list) do
+        if tostring(n):lower() == name:lower() then return true end
+    end
+    table.insert(list, name)
+    saveCfg()
+    return true
+end
+
+local function drawZoneNameList(listsKey, idp, inputKey, emptyText)
+    ImGui.SetNextItemWidth(220)
+    local v, changed = ImGui.InputText('##' .. idp .. 'Input', state[inputKey] or '')
+    if changed then state[inputKey] = v end
+    ImGui.SameLine()
+    if ImGui.Button('Add##' .. idp .. 'Add') then
+        if addZoneName(listsKey, state[inputKey]) then state[inputKey] = '' end
+    end
+
+    local tName, tType = nil, nil
+    pcall(function() tName = mq.TLO.Target.CleanName(); tType = mq.TLO.Target.Type() end)
+    if tName and tType == 'NPC' then
+        if ImGui.Button('Add Current Target (' .. tName .. ')##' .. idp .. 'AddTarget') then
+            addZoneName(listsKey, tName)
+        end
+    end
+
+    local zoneName = currentZoneShortName()
+    local list = zoneName ~= '' and cfg[listsKey][zoneName] or nil
+    if not list or #list == 0 then
+        ImGui.TextDisabled(emptyText)
+    else
+        for i, n in ipairs(list) do
+            ImGui.PushID(idp .. i)
+            ImGui.Text(n)
+            ImGui.SameLine()
+            if ImGui.SmallButton('Remove') then
+                table.remove(list, i)
+                saveCfg()
+                ImGui.PopID()
+                break
+            end
+            ImGui.PopID()
+        end
+    end
+end
+
 local function drawGUI_()
     openGUI, drawGUI = ImGui.Begin('Puller##' .. myName, openGUI)
     if drawGUI then
@@ -2888,7 +2972,7 @@ local function drawGUI_()
             ImGui.EndTabItem()
         end
 
-        if ImGui.BeginTabItem('Priority List') then
+        if ImGui.BeginTabItem('Priority / Ignore') then
             ImGui.TextDisabled('Rare/named mobs that jump the queue when up, instead of waiting their')
             ImGui.TextDisabled('turn behind whatever happens to be closer. Saved per zone.')
             ImGui.Spacing()
@@ -2901,59 +2985,26 @@ local function drawGUI_()
                     'changes WHICH mob gets picked, not what\'s allowed), it\'s pulled before\n' ..
                     'anything else, regardless of distance.')
             end
+            ImGui.SameLine()
+            local po = ImGui.Checkbox('Only pull priority mobs##priorityOnly', cfg.priorityOnly)
+            if po ~= cfg.priorityOnly then cfg.priorityOnly = po; saveCfg() end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Never picks anything that isn\'t on this zone\'s priority list as a pull.\n' ..
+                    'Nothing up (or an empty list) means nothing gets pulled. Mobs that aggro\n' ..
+                    'on their own are still fought. Needs Enabled on.')
+            end
 
             local zoneName = currentZoneShortName()
             ImGui.TextDisabled('Current zone: ' .. (zoneName ~= '' and zoneName or '(unknown)'))
             ImGui.Spacing()
-
-            ImGui.SetNextItemWidth(220)
-            local pin, pinChanged = ImGui.InputText('##priorityInput', state.priorityInput)
-            if pinChanged then state.priorityInput = pin end
-            ImGui.SameLine()
-            if ImGui.Button('Add##priorityAdd') then
-                local name = (state.priorityInput or ''):gsub('^%s+', ''):gsub('%s+$', '')
-                if name ~= '' then
-                    local list = ensurePriorityList()
-                    if list then
-                        local already = false
-                        for _, n in ipairs(list) do if n:lower() == name:lower() then already = true; break end end
-                        if not already then table.insert(list, name); saveCfg() end
-                        state.priorityInput = ''
-                    end
-                end
-            end
-
-            local tName, tType = nil, nil
-            pcall(function() tName = mq.TLO.Target.CleanName(); tType = mq.TLO.Target.Type() end)
-            if tName and tType == 'NPC' then
-                if ImGui.Button('Add Current Target (' .. tName .. ')##priorityAddTarget') then
-                    local list = ensurePriorityList()
-                    if list then
-                        local already = false
-                        for _, n in ipairs(list) do if n:lower() == tName:lower() then already = true; break end end
-                        if not already then table.insert(list, tName); saveCfg() end
-                    end
-                end
-            end
+            drawZoneNameList('priorityLists', 'prio', 'priorityInput', 'No priority names saved for this zone.')
 
             ImGui.Spacing()
-            local list = zoneName ~= '' and cfg.priorityLists[zoneName] or nil
-            if not list or #list == 0 then
-                ImGui.TextDisabled('No priority names saved for this zone.')
-            else
-                for i, n in ipairs(list) do
-                    ImGui.PushID('prio' .. i)
-                    ImGui.Text(n)
-                    ImGui.SameLine()
-                    if ImGui.SmallButton('Remove') then
-                        table.remove(list, i)
-                        saveCfg()
-                        ImGui.PopID()
-                        break
-                    end
-                    ImGui.PopID()
-                end
-            end
+            ImGui.Separator()
+            ImGui.Text('Ignore list')
+            ImGui.TextDisabled('Never picked as a pull target. If one aggros anyway (an add, proximity,')
+            ImGui.TextDisabled('a swarm drag) it\'s still fought. Saved per zone, always active.')
+            drawZoneNameList('ignoreLists', 'ignore', 'ignoreInput', 'No ignored names saved for this zone.')
             ImGui.EndTabItem()
         end
 
