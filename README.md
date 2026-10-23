@@ -43,6 +43,9 @@ the script.
 | `/puller radius <n>` | Set the Pull Radius (Camp, 10-1000) or Hunt Radius (0-1000, 0 = whole zone) for the current mode |
 | `/puller style melee\|ranged\|spell\|item` | Set the pull method |
 | `/puller engage <command>` | Set the On Engage Command (`engage clear` blanks it, `engage` alone shows it) |
+| `/puller fightend <command>` | Set the On Fight End Command (`fightend clear` blanks it, `fightend` alone shows it) |
+| `/puller ksguard on\|off` | Turn the KS guard on or off |
+| `/puller stats` / `/puller stats reset` | Print the session stats, or start them over |
 | `/puller addwp` / `/puller clearwp` | Add a waypoint at your position, or clear all waypoints |
 | `/puller swarm on\|off` | Turn Swarm Pull on or off |
 | `/puller swarm count <n>` | Set the Swarm Pull count (1-20) |
@@ -98,6 +101,8 @@ confirms aggro before dragging it home or fighting it in place.
   shifting half a step doesn't put abilities like Flying Kick out of reach. Distances include
   height, which matches how the game checks range on slopes and stairs.
 - **Ranged, Spell and Item** hand the fight to your combat script once it starts.
+- **Spell** only casts when the spell is ready, so a pull spell on cooldown isn't spammed. If
+  the spell isn't memorized, Puller says so in the console every 10 seconds.
 
 ### On Engage Command
 
@@ -114,6 +119,13 @@ On Engage Command runs whatever you put in it (for example `/assistme`) when a f
   ```text
   /multiline ; /assistme;/hidecorpse all
   ```
+
+### On Fight End Command
+
+On Fight End Command runs whatever you put in it once each time a fight ends, meaning nothing
+is left attacking you. Use it for a loot command, telling your boxes to med, or a group tell. It
+runs before [Wait for loot](#wait-for-loot) starts, so a loot command it sends is what that wait
+then sees. `/multiline` works here too. Leave it blank to do nothing.
 
 ### Targeting
 
@@ -136,6 +148,20 @@ On Engage Command runs whatever you put in it (for example `/assistme`) when a f
 - **Show radius on EQ map:** draws circles on the native EQ map (through MQ2Map's `/maploc`),
   pinned to the camp or anchor point rather than to you. The pull radius is red. In Camp mode,
   the Camp Safe Radius is green.
+
+#### KS guard
+
+**KS guard** is on by default. It keeps Puller off mobs someone else is already fighting:
+
+- **Damaged mobs:** a mob below 100% HP is never picked.
+- **Other players nearby:** a mob with a player who isn't in your group within **Other Player
+  Radius** (default 40) is skipped. Set the radius to 0 to use the HP check only.
+- **While walking over:** if the mob takes damage before you tag it, Puller drops it and picks
+  another. After your own tag fires, damage is assumed to be yours.
+- **Pulling only:** a mob that aggroes on you anyway is still fought.
+
+EQ doesn't report who an arbitrary mob is fighting, so HP and nearby players are the signals
+Puller has.
 
 ### Camp Safe Radius
 
@@ -236,6 +262,11 @@ The Resource Gate stops new pulls when HP, Mana or Endurance (whichever you turn
 below a "start" percentage. Pulling resumes once that resource is back above a higher "stop"
 percentage. You sit to recover in between.
 
+**Group** mana and HP use the same start and stop thresholds, measured on the lowest group member
+who is in the zone, online and alive. This is mainly for waiting on your healer. Mana only counts
+members who have mana. The tab shows who is lowest right now, and the status line names them
+while you rest, for example `RESTING (Clericname at 15% mana)`.
+
 ### Quality of life and safety
 
 - **Sit while idle:** sit and regenerate when there's nothing to pull.
@@ -249,13 +280,24 @@ percentage. You sit to recover in between.
 - **Missing XTarget entries:** XTarget sometimes fails to list a mob that's attacking you. When
   that happens, Puller checks whether your current target is hitting back, and reads the
   attacker's name from the combat log.
-- **Zoning:** the camp and hunt anchor remember which zone they were set in. If you zone
-  somewhere else while pulling, Puller pauses instead of heading for coordinates from the old
-  zone.
+- **Per-zone camps:** the camp and hunt anchor are saved per zone and restored when you come
+  back. Zoning while pulling pauses Puller; `/puller start` resumes.
+- **Session stats:** XP, AA, kills and plat per hour, under the status line. See
+  [Session stats](#session-stats).
 - **Debug mode:** prints a status line to the console every couple of seconds, with the state,
   the mob it's after, distance, line of sight, combat flags, XTarget and swarm counts, the
   anchor, radius and arc in use, and your HP. Use it to see why Puller is or isn't doing
   something.
+
+### Session stats
+
+The line under the status line shows session stats since the script started, or since you
+clicked **Reset**: XP (percent of a level per hour), AA per hour, kills, and plat. `/puller stats`
+prints the same line.
+
+- **Kills** are hostile mobs from your XTarget that died. A mob that despawns or runs off isn't
+  counted.
+- **Plat** is the change in the coin you're carrying, so buying, selling and banking count too.
 
 ## Using Puller with a combat script
 
