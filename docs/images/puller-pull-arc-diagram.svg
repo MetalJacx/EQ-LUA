@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="560" viewBox="0 0 920 560" font-family="DejaVu Sans, Arial, Helvetica, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#24292f"/>
+    </marker>
+  </defs>
+
+  <!-- card -->
+  <rect x="1" y="1" width="918" height="558" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="2"/>
+
+  <!-- ===================== left: how a mob is judged ===================== -->
+  <text x="24" y="38" font-size="20" font-weight="bold" fill="#24292f">How the pull arc decides (top-down view)</text>
+
+  <!-- compass -->
+  <text x="40" y="84" font-size="15" font-weight="bold" fill="#57606a" text-anchor="middle">N</text>
+  <line x1="40" y1="120" x2="40" y2="92" stroke="#57606a" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- pull radius -->
+  <circle cx="290" cy="300" r="200" fill="#f6f8fa" stroke="#cf222e" stroke-width="2.5" stroke-dasharray="8 6"/>
+  <text x="430" y="476" font-size="14" fill="#cf222e">Pull Radius</text>
+
+  <!-- arc wedge: heading North, width 90 (45 each side) -->
+  <path d="M290,300 L148.6,158.6 A200,200 0 0 1 431.4,158.6 Z" fill="#2da44e" fill-opacity="0.22" stroke="#2da44e" stroke-width="2.5"/>
+
+  <!-- heading arrow (starts above the width label so they don't cross) -->
+  <line x1="290" y1="214" x2="290" y2="82" stroke="#24292f" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#arrow)"/>
+  <text x="280" y="80" font-size="14" fill="#24292f" text-anchor="end">Locked heading</text>
+
+  <!-- width angle -->
+  <path d="M265.3,275.3 A35,35 0 0 1 314.7,275.3" fill="none" stroke="#1a7f37" stroke-width="2"/>
+  <text x="290" y="234" font-size="13" font-weight="bold" fill="#1a7f37" text-anchor="middle">Arc Width 90°</text>
+  <text x="290" y="250" font-size="12" fill="#1a7f37" text-anchor="middle">(45° each side)</text>
+
+  <!-- camp -->
+  <rect x="280" y="290" width="20" height="20" rx="3" fill="#bf8700" stroke="#7d4e00" stroke-width="2"/>
+  <text x="290" y="334" font-size="14" font-weight="bold" fill="#7d4e00" text-anchor="middle">Camp / anchor</text>
+
+  <!-- mob A: pulled -->
+  <circle cx="308" cy="140" r="11" fill="#2da44e" stroke="#1a7f37" stroke-width="2"/>
+  <path d="M302,140 l4,5 l8,-10" fill="none" stroke="#ffffff" stroke-width="3"/>
+  <text x="325" y="136" font-size="14" font-weight="bold" fill="#1a7f37">Pulled</text>
+  <text x="325" y="152" font-size="12" fill="#1a7f37">in arc and radius</text>
+
+  <!-- mob B: outside arc -->
+  <circle cx="420" cy="290" r="11" fill="#8c959f" stroke="#57606a" stroke-width="2"/>
+  <path d="M415,285 l10,10 M425,285 l-10,10" stroke="#ffffff" stroke-width="3"/>
+  <text x="420" y="320" font-size="14" font-weight="bold" fill="#57606a" text-anchor="middle">Skipped</text>
+  <text x="420" y="336" font-size="12" fill="#57606a" text-anchor="middle">outside arc</text>
+
+  <!-- mob C: outside radius -->
+  <circle cx="370" cy="62" r="11" fill="#8c959f" stroke="#57606a" stroke-width="2"/>
+  <path d="M365,57 l10,10 M375,57 l-10,10" stroke="#ffffff" stroke-width="3"/>
+  <text x="388" y="58" font-size="14" font-weight="bold" fill="#57606a">Skipped</text>
+  <text x="388" y="74" font-size="12" fill="#57606a">past radius</text>
+
+  <!-- player -->
+  <circle cx="150" cy="410" r="10" fill="#0969da" stroke="#0550ae" stroke-width="2"/>
+  <text x="166" y="406" font-size="14" font-weight="bold" fill="#0550ae">You</text>
+  <text x="166" y="422" font-size="12" fill="#0550ae">where you stand doesn't matter</text>
+
+  <text x="24" y="530" font-size="13" fill="#57606a">Both the arc and the radius are measured from the camp/anchor, flat (height is ignored).</text>
+
+  <!-- ===================== right: width examples ===================== -->
+  <line x1="600" y1="60" x2="600" y2="510" stroke="#d0d7de" stroke-width="2"/>
+  <text x="760" y="38" font-size="20" font-weight="bold" fill="#24292f" text-anchor="middle">Arc Width examples</text>
+  <text x="760" y="60" font-size="12" fill="#57606a" text-anchor="middle">heading North in all four</text>
+
+  <!-- 0 / 360: off -->
+  <circle cx="680" cy="160" r="50" fill="#2da44e" fill-opacity="0.22" stroke="#2da44e" stroke-width="2"/>
+  <rect x="673" y="153" width="14" height="14" rx="2" fill="#bf8700"/>
+  <text x="680" y="234" font-size="14" font-weight="bold" fill="#24292f" text-anchor="middle">0 (or 360)</text>
+  <text x="680" y="252" font-size="12" fill="#57606a" text-anchor="middle">off: full circle</text>
+
+  <!-- 180 -->
+  <circle cx="840" cy="160" r="50" fill="none" stroke="#d0d7de" stroke-width="2"/>
+  <path d="M840,160 L790,160 A50,50 0 0 1 890,160 Z" fill="#2da44e" fill-opacity="0.22" stroke="#2da44e" stroke-width="2"/>
+  <rect x="833" y="153" width="14" height="14" rx="2" fill="#bf8700"/>
+  <text x="840" y="234" font-size="14" font-weight="bold" fill="#24292f" text-anchor="middle">180</text>
+  <text x="840" y="252" font-size="12" fill="#57606a" text-anchor="middle">front half</text>
+
+  <!-- 90 -->
+  <circle cx="680" cy="370" r="50" fill="none" stroke="#d0d7de" stroke-width="2"/>
+  <path d="M680,370 L644.6,334.6 A50,50 0 0 1 715.4,334.6 Z" fill="#2da44e" fill-opacity="0.22" stroke="#2da44e" stroke-width="2"/>
+  <rect x="673" y="363" width="14" height="14" rx="2" fill="#bf8700"/>
+  <text x="680" y="444" font-size="14" font-weight="bold" fill="#24292f" text-anchor="middle">90</text>
+  <text x="680" y="462" font-size="12" fill="#57606a" text-anchor="middle">a quarter</text>
+
+  <!-- 30 -->
+  <circle cx="840" cy="370" r="50" fill="none" stroke="#d0d7de" stroke-width="2"/>
+  <path d="M840,370 L827.1,321.7 A50,50 0 0 1 852.9,321.7 Z" fill="#2da44e" fill-opacity="0.22" stroke="#2da44e" stroke-width="2"/>
+  <rect x="833" y="363" width="14" height="14" rx="2" fill="#bf8700"/>
+  <text x="840" y="444" font-size="14" font-weight="bold" fill="#24292f" text-anchor="middle">30</text>
+  <text x="840" y="462" font-size="12" fill="#57606a" text-anchor="middle">a narrow lane</text>
+</svg>

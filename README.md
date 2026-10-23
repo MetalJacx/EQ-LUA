@@ -176,10 +176,17 @@ Camp Safe Radius is a Camp mode setting with a default of 30 (0 turns it off).
 
 ### Pull arc
 
-![Pull Arc tab with the live direction preview](docs/images/puller-pull-arc.png)
+![How the pull arc decides which mobs to pull](docs/images/puller-pull-arc-diagram.png)
 
 The pull arc works like KissAssist's `/setpullarc`: it limits pulls to a cone in one direction
 instead of the full circle.
+
+- A mob is pulled only if it's inside **both** the pull radius and the arc. **Arc Width** is the
+  whole slice (90 means 45° each side of the heading), and 0 turns the arc off.
+- The arc is measured from the camp or anchor, not from you, and height is ignored. It only
+  decides what gets pulled: a mob outside it that aggroes anyway is still fought.
+
+![Pull Arc tab with the live direction preview](docs/images/puller-pull-arc.png)
 
 - The Pull Arc tab has a live preview that turns with you while you aim.
 - **Lock Heading** commits the direction and **Re-aim** lets you change it. Aiming is separate
