@@ -68,7 +68,14 @@
       - Resource gate: won't start a new pull if HP/Mana/Endurance (whichever
         you enable) is at or below a "start" %, and won't resume until it's
         back above a higher "stop" % -- same hysteresis shape as triune.lua's
-        MedBreak, scoped to the puller.
+        MedBreak, scoped to the puller. Optionally also on the lowest group
+        member's mana/HP (e.g. waiting on your healer).
+      - KS guard: skips mobs already below 100% HP or with a non-group player
+        near them, and drops a pull that gets damaged before you tag it.
+      - Per-zone camps: the camp spot / hunt anchor is remembered per zone
+        and restored when you come back.
+      - On Fight End command (counterpart to onEngageCommand), and session
+        stats (XP/AA/kills/plat per hour) on the main window.
 
     Deliberately out of scope (this is "find/tag/drag or fight", not a full
     combat script): hazard-avoidance detours, navmesh-isolation recovery,
@@ -132,6 +139,10 @@ local function defaultCfg()
         -- only ever gets invoked once per pull instead of being driven by
         -- a repeating condition elsewhere.
         onEngageCommand = '',
+        -- Counterpart to onEngageCommand: fired once each time a fight ends
+        -- (state goes back to IDLE with nothing left hating you). Blank = do
+        -- nothing. For a loot command, telling boxes to med, a group tell.
+        onFightEndCommand = '',
         -- Pull Mode: 'Camp' drags every tagged mob back to campLoc (as
         -- before); 'Hunt' fights each mob where it's tagged instead.
         pullMode = 'Camp',
@@ -159,9 +170,20 @@ local function defaultCfg()
         huntZ = 75,
         huntArcWidth = 0,
         huntHeading = nil,
+        -- Camp spot / hunt anchor remembered per zone: zoneShortName ->
+        -- { campLoc=, campHeading=, huntAnchor=, huntHeading= }. campLoc/
+        -- huntAnchor above always hold the CURRENT zone's entry; zoning
+        -- swaps them out (see loadZoneAnchors).
+        zoneAnchors = {},
         minLevel = 1,
         maxLevel = 100,
         conFilter = defaultConFilter(),
+        -- KS guard: never pick a mob someone else is already on -- skipped
+        -- if it's below 100% HP, or a player outside your group is within
+        -- ksRadius of it (0 = HP check only). A pull filter only: anything
+        -- that aggros on you anyway is fought as usual.
+        ksGuard = true,
+        ksRadius = 40,
         -- Shows the active radius as a red circle on the native EQ map,
         -- pinned to the camp/anchor point via MQ2Map's /maploc.
         showMapCircle = true,
@@ -194,6 +216,10 @@ local function defaultCfg()
         hpOn = false, hpStart = 20, hpStop = 90,
         manaOn = true, manaStart = 20, manaStop = 90,
         endOn = false, endStart = 20, endStop = 90,
+        -- Same hysteresis, on the LOWEST group member in zone (alive, not
+        -- offline): mana only counts members that have mana at all.
+        groupManaOn = false, groupManaStart = 20, groupManaStop = 80,
+        groupHpOn = false, groupHpStart = 40, groupHpStop = 90,
         -- Swarm Pull (ported from tac/swarm_pull.lua's design): gather this
         -- many mobs onto XTarget BEFORE engaging, instead of tagging and
         -- fighting one at a time. Tagging during the gather is a body pull
@@ -267,6 +293,7 @@ do
         if type(cfg.conFilter) ~= 'table' then cfg.conFilter = defaultConFilter() end
         if type(cfg.priorityLists) ~= 'table' then cfg.priorityLists = {} end
         if type(cfg.ignoreLists) ~= 'table' then cfg.ignoreLists = {} end
+        if type(cfg.zoneAnchors) ~= 'table' then cfg.zoneAnchors = {} end
         -- A saved Min > Max (possible before the UI clamp existed) would
         -- otherwise display that way forever even though findPullTarget()
         -- now tolerates it -- fix the stored values too, not just the
@@ -330,6 +357,19 @@ local state = {
     ignoreInput = '',      -- same, for the Ignore list's Add box
     lootWaitSince = nil,   -- os.clock() the current post-fight loot wait began, nil = not waiting
     lootSeenAt = nil,      -- os.clock() LootWnd was last seen open during this wait
+    tagFired = false,      -- fireTag() already ran for the current TO_MOB target
+    spellWarnAt = 0,       -- os.clock() of the last "pull spell not memorized" warning
+    restReason = '',       -- what tripped the resource gate, for the status/print
+    -- Session stats (main window). Times are os.time() (wall clock), not
+    -- os.clock(): in-game os.clock readings aren't trustworthy here.
+    statsStartAt = os.time(),
+    statsStartXp = nil,    -- Level*100 + PctExp at session start
+    statsStartAA = nil,    -- AA total (+ fraction) at session start
+    statsStartPlat = nil,  -- carried plat (Cash / 1000) at session start
+    statsXp = nil, statsAA = nil, statsPlat = nil, -- latest readings
+    statsUpdatedAt = 0,    -- os.time() of the last reading
+    statsKills = 0,
+    statsSeen = {},        -- hostile id -> true, watched for turning into a corpse
 }
 
 local openGUI, drawGUI = true, true
@@ -963,6 +1003,34 @@ local function currentZoneShortName()
     pcall(function() zs = mq.TLO.Zone.ShortName() or '' end)
     return zs
 end
+
+-- Per-zone camp spot / hunt anchor. cfg.campLoc/huntAnchor (and headings)
+-- stay the working copy everything else reads; these file the current
+-- zone's copy away in cfg.zoneAnchors and swap it back in on zoning.
+-- Called from every set/clear site, where cfg already holds this zone's.
+local function saveAnchors()
+    local zs = currentZoneShortName()
+    if zs ~= '' then
+        if cfg.campLoc or cfg.huntAnchor then
+            cfg.zoneAnchors[zs] = {
+                campLoc = cfg.campLoc, campHeading = cfg.campHeading,
+                huntAnchor = cfg.huntAnchor, huntHeading = cfg.huntHeading,
+            }
+        else
+            cfg.zoneAnchors[zs] = nil
+        end
+    end
+    saveCfg()
+end
+
+-- Swaps in zs's saved camp/anchor (nil for both if none saved there).
+local function loadZoneAnchors(zs)
+    local a = cfg.zoneAnchors[zs] or {}
+    cfg.campLoc, cfg.campHeading = a.campLoc, a.campHeading
+    cfg.huntAnchor, cfg.huntHeading = a.huntAnchor, a.huntHeading
+    -- Pull Arc tab re-decides aim/lock for the swapped-in headings.
+    state.arcAiming = {}
+end
 -- Read-only: the current zone's priority list, or nil if it has none or the
 -- feature is off. Callers that need to MUTATE a list use ensureZoneList.
 local function currentPriorityList()
@@ -1003,6 +1071,31 @@ local function isPriorityName(cleanName)
         if tostring(n):lower() == lname then return true end
     end
     return false
+end
+
+-- KS guard: positions of the nearest PCs that aren't you or in your group,
+-- gathered once per scan rather than once per candidate. (EQ exposes no
+-- "who is this mob fighting" for an arbitrary spawn, so another player
+-- standing on it is the closest available signal besides its HP.)
+local function otherPlayerPositions()
+    local group = {}
+    pcall(function()
+        for i = 1, (mq.TLO.Group.Members() or 0) do
+            local n = mq.TLO.Group.Member(i).CleanName()
+            if n then group[n] = true end
+        end
+    end)
+    local myId = mq.TLO.Me.ID() or 0
+    local list = {}
+    for i = 1, 50 do
+        local s = mq.TLO.NearestSpawn(i, 'pc')
+        if not s() then break end
+        local n = s.CleanName()
+        if (s.ID() or 0) ~= myId and not (n and group[n]) then
+            list[#list + 1] = { x = s.X() or 0, y = s.Y() or 0, z = s.Z() or 0 }
+        end
+    end
+    return list
 end
 
 -- extraExclude(sid), if given, is an additional per-candidate skip check on
@@ -1061,6 +1154,8 @@ local function findPullTarget(extraExclude)
     if priorityOnly and not hasPriority then return nil end
     local ignoreSet = currentIgnoreSet()
     local useNav = navLoaded()
+    local ksR = cfg.ksGuard and (cfg.ksRadius or 0) or 0
+    local otherPcs = ksR > 0 and otherPlayerPositions() or nil
     for i = 1, 60 do
         local s = mq.TLO.NearestSpawn(i, p)
         if not s() then break end
@@ -1088,6 +1183,16 @@ local function findPullTarget(extraExclude)
                     -- checked before the (costly) path length below.
                     if ignoreSet and cname and ignoreSet[cname:lower()] then goto continue end
                     if priorityOnly and not isPriorityName(cname) then goto continue end
+                    -- KS guard: already damaged, or another player is on it.
+                    if cfg.ksGuard then
+                        if (s.PctHPs() or 100) < 100 then goto continue end
+                        if otherPcs then
+                            for _, pc in ipairs(otherPcs) do
+                                local kx, ky, kz = pc.x - sx, pc.y - sy, pc.z - sz
+                                if kx * kx + ky * ky + kz * kz <= ksR * ksR then goto continue end
+                            end
+                        end
+                    end
                     local tier = cname and state.conCache[cname]
                     if not tier or cfg.conFilter[tier] ~= false then
                         local ddx, ddy, ddz = sx - mx, sy - my, sz - mz
@@ -1297,7 +1402,21 @@ local function fireTag(id)
     elseif style == 'Spell' then
         mq.cmd('/face fast')
         if cfg.pullSpell ~= '' and mq.TLO.Me.Casting() == nil then
-            mq.cmdf('/cast "%s"', cfg.pullSpell)
+            -- Same idea as the Item branch's TimerReady() check: without it
+            -- a spell still on cooldown got /cast every tick until it landed.
+            -- Not memorized reads as not ready too, so say so (throttled)
+            -- instead of standing in range silently forever.
+            local ready, memmed = false, true
+            pcall(function()
+                ready = mq.TLO.Me.SpellReady(cfg.pullSpell)() == true
+                memmed = mq.TLO.Me.Gem(cfg.pullSpell)() ~= nil
+            end)
+            if ready then
+                mq.cmdf('/cast "%s"', cfg.pullSpell)
+            elseif not memmed and os.clock() - state.spellWarnAt >= 10 then
+                state.spellWarnAt = os.clock()
+                printf('Pull spell "%s" is not memorized -- memorize it or change Pull Spell.', cfg.pullSpell)
+            end
         end
     elseif style == 'Item' then
         mq.cmd('/face fast')
@@ -1315,6 +1434,32 @@ end
 -- ----------------------------------------------------------------------------
 -- Resource gate (hysteresis, same shape as triune's MedBreak)
 -- ----------------------------------------------------------------------------
+-- Lowest HP% and lowest mana% among the OTHER group members in zone (alive,
+-- online), with who it is. Mana only counts members that have mana. nil =
+-- nobody to count. Same Group.Member fields tac/hud_group.lua reads.
+local function groupLows()
+    local lowHp, hpName, lowMana, manaName = nil, nil, nil, nil
+    local n = 0
+    pcall(function() n = mq.TLO.Group.Members() or 0 end)
+    for i = 1, n do
+        pcall(function()
+            local m = mq.TLO.Group.Member(i)
+            if not m() or m.Offline() or m.OtherZone() or (m.ID() or 0) <= 0 then return end
+            local dead = false
+            pcall(function() dead = m.Dead() == true or (m.Type() or '') == 'Corpse' end)
+            if dead then return end
+            local name = m.CleanName() or ('Member ' .. i)
+            local hp = m.PctHPs()
+            if hp and (not lowHp or hp < lowHp) then lowHp, hpName = hp, name end
+            local hasMana = (m.MaxMana() or 0) > 0
+            if not hasMana then pcall(function() hasMana = m.Class.CanCast() == true end) end
+            local mp = hasMana and m.PctMana() or nil
+            if mp and (not lowMana or mp < lowMana) then lowMana, manaName = mp, name end
+        end)
+    end
+    return lowHp, hpName, lowMana, manaName
+end
+
 local function checkRestGate()
     if not cfg.restEnabled then
         if state.resting then
@@ -1330,18 +1475,32 @@ local function checkRestGate()
     local hasMana = (mq.TLO.Me.MaxMana() or 0) > 0
     local hasEnd = (mq.TLO.Me.MaxEndurance() or 0) > 0
     local fighting = inCombat()
+    local gHp, gHpName, gMana, gManaName = nil, nil, nil, nil
+    if cfg.groupHpOn or cfg.groupManaOn then gHp, gHpName, gMana, gManaName = groupLows() end
 
     if not state.resting then
         local trigger = (cfg.hpOn and hp <= cfg.hpStart)
             or (cfg.manaOn and hasMana and mp <= cfg.manaStart)
             or (cfg.endOn and hasEnd and ep <= cfg.endStart)
-        if trigger and not fighting then
+        local groupWho = nil
+        if cfg.groupHpOn and gHp and gHp <= (cfg.groupHpStart or 40) then
+            groupWho = string.format('%s at %d%% HP', gHpName, math.floor(gHp))
+        elseif cfg.groupManaOn and gMana and gMana <= (cfg.groupManaStart or 20) then
+            groupWho = string.format('%s at %d%% mana', gManaName, math.floor(gMana))
+        end
+        if (trigger or groupWho) and not fighting then
             state.resting = true
             if mq.TLO.Navigation.Active() then mq.cmd('/nav stop') end
             if state.pullState == 'TO_MOB' or state.pullState == 'IDLE' then
                 state.pullState = 'IDLE'; state.pullTargetId = 0
             end
-            printf('Resting: HP %d%% MP %d%% EP %d%% below threshold -- pausing pulls until recovered.', hp, mp, ep)
+            if trigger then
+                state.restReason = 'you'
+                printf('Resting: HP %d%% MP %d%% EP %d%% below threshold -- pausing pulls until recovered.', hp, mp, ep)
+            else
+                state.restReason = groupWho
+                printf('Resting: group member %s -- pausing pulls until recovered.', groupWho)
+            end
             if canSitNow() and not isSittingOrDucking() then mq.cmd('/sit') end
             return true
         end
@@ -1367,7 +1526,9 @@ local function checkRestGate()
         local hpOk = (not cfg.hpOn) or hp >= cfg.hpStop
         local mpOk = (not cfg.manaOn) or (not hasMana) or mp >= cfg.manaStop
         local epOk = (not cfg.endOn) or (not hasEnd) or ep >= cfg.endStop
-        if hpOk and mpOk and epOk then
+        local gHpOk = (not cfg.groupHpOn) or (not gHp) or gHp >= (cfg.groupHpStop or 90)
+        local gMpOk = (not cfg.groupManaOn) or (not gMana) or gMana >= (cfg.groupManaStop or 80)
+        if hpOk and mpOk and epOk and gHpOk and gMpOk then
             state.resting = false
             if isSittingOrDucking() then mq.cmd('/stand') end
             printf('Recovered -- resuming pulls.')
@@ -1675,6 +1836,115 @@ local function beginLootWait()
     state.lootSeenAt = nil
 end
 
+-- One place for "a fight just ended" (FIGHTING -> IDLE, or a swarm drag
+-- with nothing left hating you): fires On Fight End once, then starts the
+-- loot wait -- in that order, so a loot command it runs is what the wait
+-- then sees open.
+local function onFightEnded()
+    if cfg.onFightEndCommand and cfg.onFightEndCommand ~= '' then
+        printf('Fight over -- running onFightEndCommand.')
+        mq.cmd(cfg.onFightEndCommand)
+    end
+    beginLootWait()
+end
+
+-- ----------------------------------------------------------------------------
+-- Session stats (main window): XP, AA, kills and plat per hour since the
+-- script started (or Reset). Readings mirror triune.lua's session tracker
+-- (UI.getCurrentAA / getCurrentPlat).
+-- ----------------------------------------------------------------------------
+local function readXp()
+    local v = nil
+    pcall(function()
+        local lvl, pct = mq.TLO.Me.Level(), mq.TLO.Me.PctExp()
+        if lvl and pct then v = lvl * 100 + pct end
+    end)
+    return v
+end
+
+local function readAA()
+    local v = nil
+    pcall(function()
+        local total = mq.TLO.Me.AAPointsTotal()
+        if type(total) ~= 'number' then
+            total = (mq.TLO.Me.AAPointsSpent() or 0) + (mq.TLO.Me.AAPoints() or 0)
+        end
+        v = total + (mq.TLO.Me.PctAAExp() or 0) / 100
+    end)
+    return v
+end
+
+-- Carried coin in plat (Cash is in copper). Buying, selling and banking
+-- move this too -- it's net coin, not just loot.
+local function readPlat()
+    local v = nil
+    pcall(function()
+        local cash = mq.TLO.Me.Cash()
+        if type(cash) == 'number' and cash >= 0 then v = cash / 1000 end
+    end)
+    return v
+end
+
+local function resetStats()
+    state.statsStartAt = os.time()
+    state.statsStartXp, state.statsStartAA, state.statsStartPlat = nil, nil, nil
+    state.statsKills = 0
+    state.statsUpdatedAt = 0
+end
+
+-- Every tick. Kills: every hostile on XTarget (or being fought) is watched,
+-- and one that turns into a corpse -- an NPC's corpse keeps its spawn id --
+-- counts. One that just vanishes (despawned, ran off, you zoned) doesn't.
+-- XP/AA/plat are read once a second.
+local function statsTick()
+    local live = {}
+    local function watch(id)
+        if id and id > 0 and isHostileNpc(id) then
+            live[id] = true
+            state.statsSeen[id] = true
+        end
+    end
+    local slots = mq.TLO.Me.XTargetSlots() or 13
+    for i = 1, slots do
+        local xt = mq.TLO.Me.XTarget(i)
+        if xt() then watch(xt.ID() or 0) end
+    end
+    if state.pullState == 'FIGHTING' then watch(state.pullTargetId) end
+    for id in pairs(state.statsSeen) do
+        if not live[id] then
+            local corpse = false
+            pcall(function()
+                local s = mq.TLO.Spawn(id)
+                corpse = s() and ((s.Type() or '') == 'Corpse' or s.Dead() == true) or false
+            end)
+            if corpse then state.statsKills = state.statsKills + 1 end
+            state.statsSeen[id] = nil
+        end
+    end
+
+    local now = os.time()
+    if now == state.statsUpdatedAt then return end
+    state.statsUpdatedAt = now
+    local xp, aa, plat = readXp(), readAA(), readPlat()
+    if xp then state.statsStartXp = state.statsStartXp or xp; state.statsXp = xp end
+    if aa then state.statsStartAA = state.statsStartAA or aa; state.statsAA = aa end
+    if plat then state.statsStartPlat = state.statsStartPlat or plat; state.statsPlat = plat end
+end
+
+local function statsLine()
+    local secs = math.max(0, os.time() - state.statsStartAt)
+    -- Rates over at least a minute, so the first few kills don't read as
+    -- hundreds per hour.
+    local hours = math.max(secs, 60) / 3600
+    local function delta(cur, start) return (cur and start) and (cur - start) or 0 end
+    local xp = delta(state.statsXp, state.statsStartXp)
+    local aa = delta(state.statsAA, state.statsStartAA)
+    local plat = delta(state.statsPlat, state.statsStartPlat)
+    return string.format('XP %.1f%%/hr | AA %.2f/hr | Kills %d (%.0f/hr) | Plat %d (%.0f/hr) | %dh%02dm',
+        xp / hours, aa / hours, state.statsKills, state.statsKills / hours,
+        math.floor(plat), plat / hours, math.floor(secs / 3600), math.floor(secs % 3600 / 60))
+end
+
 -- True while IDLE should hold for looting. Phases, in order:
 --   1. LootWnd open -> looting right now.
 --   2. Seen open this wait and closed less than lootGapGrace ago -> the
@@ -1744,7 +2014,7 @@ local function pullTick()
         else
             return
         end
-        saveCfg()
+        saveAnchors()
         return
     end
 
@@ -1795,6 +2065,7 @@ local function pullTick()
             state.navBestAt = os.clock()
             state.navUnstuckTried = false
             state.navLosBackoffCount = 0
+            state.tagFired = false
             state.engagedIds = {}
             state.lastAnnounceAt = 0
             state.lastChaseId = 0
@@ -2038,6 +2309,20 @@ local function pullTick()
             state.pullState = 'IDLE'; state.pullTargetId = 0
             return
         end
+        -- KS guard, en route: someone else started on it while we walked
+        -- over. Only before our own tag fires -- after that, the damage
+        -- could just be ours landing ahead of XTarget catching up.
+        if cfg.ksGuard and not state.tagFired and not isOnXTarget(id) then
+            local pct = 100
+            pcall(function() pct = mq.TLO.Spawn(id).PctHPs() or 100 end)
+            if pct < 100 then
+                printf('Someone else is already on #%d -- leaving it to them.', id)
+                state.tempIgnore[id] = os.clock() + 60
+                if mq.TLO.Navigation.Active() then mq.cmd('/nav stop') end
+                state.pullState = 'IDLE'; state.pullTargetId = 0
+                return
+            end
+        end
 
         local arrived, stillGoing = navTowardId(id, pullReach(id), pullApproach(id))
         if not stillGoing then
@@ -2049,6 +2334,7 @@ local function pullTick()
         end
         if arrived then
             fireTag(id)
+            state.tagFired = true
             if haveAggro(id) then
                 -- Hunt fights where it's tagged; Camp drags it home.
                 if cfg.pullMode == 'Hunt' then
@@ -2077,7 +2363,7 @@ local function pullTick()
             -- drop you straight back to IDLE mid-fight.
             if countSwarmHaters() == 0 and not recentUnknownAttacker() then
                 state.pullState = 'IDLE'; state.pullTargetId = 0
-                beginLootWait()
+                onFightEnded()
                 return
             end
         else
@@ -2298,7 +2584,7 @@ local function pullTick()
             state.lastChaseId = 0
             state.meleeChaseStuckSince = nil
             state.campSafeBypassId = 0
-            beginLootWait()
+            onFightEnded()
         end
         return
     end
@@ -2320,7 +2606,9 @@ local function statusLine()
         cfg.pullMode, stateLabel,
         state.pullTargetId > 0 and ('#' .. state.pullTargetId) or '-',
         anchorLabel, c and string.format('%.0f,%.0f', c.y, c.x) or 'not set',
-        state.resting and 'RESTING' or (cfg.enabled and 'active' or 'stopped'))
+        state.resting and ((state.restReason ~= '' and state.restReason ~= 'you')
+            and ('RESTING (' .. state.restReason .. ')') or 'RESTING')
+            or (cfg.enabled and 'active' or 'stopped'))
 end
 
 -- Quick-glance color for the status line: gray while stopped, cyan while
@@ -2453,7 +2741,7 @@ local function drawArcTab()
         if ImGui.Button('Lock Heading##arcLock') then
             local newHeading = mq.TLO.Me.Heading.Degrees()
             if isCamp then cfg.campHeading = newHeading else cfg.huntHeading = newHeading end
-            saveCfg()
+            saveAnchors()
             state.arcAiming[modeKey] = false
         end
         if ImGui.IsItemHovered() then
@@ -2545,6 +2833,14 @@ local function drawGUI_()
     if drawGUI then
         local scR, scG, scB, scA = statusColor()
         ImGui.TextColored(scR, scG, scB, scA, statusLine())
+        ImGui.TextDisabled(statsLine())
+        ImGui.SameLine()
+        if ImGui.SmallButton('Reset##statsReset') then resetStats() end
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Session stats since the script started (or the last Reset).\n' ..
+                'XP is percent of a level per hour. Kills = hostiles from XTarget that died.\n' ..
+                'Plat is net carried coin, so buying/selling/banking count too.')
+        end
         ImGui.Separator()
         ImGui.Spacing()
 
@@ -2591,13 +2887,13 @@ local function drawGUI_()
                     cfg.campLoc = { x = x, y = y, z = z, zone = currentZoneShortName() }
                     cfg.campHeading = mq.TLO.Me.Heading.Degrees()
                     state.arcAiming.Camp = false
-                    saveCfg()
+                    saveAnchors()
                 end
             end
             ImGui.SameLine()
             if ImGui.Button('Clear Camp') then
                 cfg.campLoc = nil
-                saveCfg()
+                saveAnchors()
             end
         else
             if ImGui.Button('Set Hunt Anchor Here') then
@@ -2606,13 +2902,13 @@ local function drawGUI_()
                     cfg.huntAnchor = { x = x, y = y, z = z, zone = currentZoneShortName() }
                     cfg.huntHeading = mq.TLO.Me.Heading.Degrees()
                     state.arcAiming.Hunt = false
-                    saveCfg()
+                    saveAnchors()
                 end
             end
             ImGui.SameLine()
             if ImGui.Button('Clear Anchor (roam unrestricted)') then
                 cfg.huntAnchor = nil
-                saveCfg()
+                saveAnchors()
             end
         end
 
@@ -2671,6 +2967,14 @@ local function drawGUI_()
             if oeChanged then cfg.onEngageCommand = oe; saveCfg() end
             if ImGui.IsItemHovered() then
                 ImGui.SetTooltip('Runs once, the instant the fight actually begins (Camp or Hunt).\nFor handing off to a combat script, e.g. /cleartargets stick.\nLeave blank to do nothing.')
+            end
+            ImGui.SetNextItemWidth(220)
+            local fe, feChanged = ImGui.InputText('On Fight End Command##onFightEndCommand', cfg.onFightEndCommand or '')
+            if feChanged then cfg.onFightEndCommand = fe; saveCfg() end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Runs once each time a fight ends (nothing left hating you).\n' ..
+                    'For looting, telling boxes to med, a group tell, etc.\n' ..
+                    'For several commands: /multiline ; /cmd1;/cmd2\nLeave blank to do nothing.')
             end
             ImGui.Spacing()
             ImGui.Separator()
@@ -2761,6 +3065,19 @@ local function drawGUI_()
             if maxL ~= cfg.maxLevel then
                 cfg.maxLevel = math.max(maxL, cfg.minLevel)
                 saveCfg()
+            end
+
+            local ks = ImGui.Checkbox('Skip mobs someone else is on (KS guard)##ksGuard', cfg.ksGuard)
+            if ks ~= cfg.ksGuard then cfg.ksGuard = ks; saveCfg() end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Never picks a mob that is already below 100 percent HP, or that a player\n' ..
+                    'outside your group is standing near. Also drops a pull if the mob gets\n' ..
+                    'damaged while you\'re still walking to it. Anything that aggros on you\n' ..
+                    'anyway is still fought as usual.')
+            end
+            if cfg.ksGuard then
+                local kr = preciseSlider('Other Player Radius (0 = HP only)##ksRadius', cfg.ksRadius or 40, 0, 200)
+                if kr ~= cfg.ksRadius then cfg.ksRadius = kr; saveCfg() end
             end
 
             ImGui.TextDisabled('Faction consideration (pullable tiers, worst to best):')
@@ -2913,6 +3230,34 @@ local function drawGUI_()
                 local p = preciseSlider('Stop %##endStop', cfg.endStop, 1, 100)
                 if p ~= cfg.endStop then cfg.endStop = p; saveCfg() end
             end
+
+            ImGui.Spacing()
+            ImGui.Separator()
+            ImGui.Text('Group')
+            ImGui.TextDisabled('Same thresholds, on the lowest group member in zone (e.g. your healer).')
+
+            local gmOn = ImGui.Checkbox('Group Mana##groupManaOn', cfg.groupManaOn)
+            if gmOn ~= cfg.groupManaOn then cfg.groupManaOn = gmOn; saveCfg() end
+            if cfg.groupManaOn then
+                local s = preciseSlider('Start %##groupManaStart', cfg.groupManaStart, 1, 99)
+                if s ~= cfg.groupManaStart then cfg.groupManaStart = s; saveCfg() end
+                local p = preciseSlider('Stop %##groupManaStop', cfg.groupManaStop, 1, 100)
+                if p ~= cfg.groupManaStop then cfg.groupManaStop = p; saveCfg() end
+            end
+
+            local ghOn = ImGui.Checkbox('Group HP##groupHpOn', cfg.groupHpOn)
+            if ghOn ~= cfg.groupHpOn then cfg.groupHpOn = ghOn; saveCfg() end
+            if cfg.groupHpOn then
+                local s = preciseSlider('Start %##groupHpStart', cfg.groupHpStart, 1, 99)
+                if s ~= cfg.groupHpStart then cfg.groupHpStart = s; saveCfg() end
+                local p = preciseSlider('Stop %##groupHpStop', cfg.groupHpStop, 1, 100)
+                if p ~= cfg.groupHpStop then cfg.groupHpStop = p; saveCfg() end
+            end
+
+            local gLowHp, gLowHpName, gLowMana, gLowManaName = groupLows()
+            ImGui.TextDisabled(string.format('Lowest now: mana %s   HP %s',
+                gLowMana and string.format('%d (%s)', math.floor(gLowMana), gLowManaName) or '-',
+                gLowHp and string.format('%d (%s)', math.floor(gLowHp), gLowHpName) or '-'))
             ImGui.EndTabItem()
         end
 
@@ -3101,6 +3446,8 @@ local function printHelp()
     printf('  setcamp | clearcamp -- camp spot         setanchor | clearanchor -- hunt anchor')
     printf('  addwp | clearwp -- waypoints             radius <n> -- pull/hunt radius')
     printf('  style melee|ranged|spell|item            engage <command> | engage clear')
+    printf('  fightend <command> | fightend clear      ksguard on|off')
+    printf('  stats | stats reset -- XP/AA/kills/plat per hour')
     printf('  swarm on|off | swarm count <n>           lootwait on|off       debug on|off')
     printf('  priority on|off | priorityonly on|off')
     printf('  priority add|remove [name]  ignore add|remove [name]  (no name = your target)')
@@ -3132,11 +3479,11 @@ local function cmd_puller(...)
             cfg.campLoc = { x = x, y = y, z = z, zone = currentZoneShortName() }
             cfg.campHeading = mq.TLO.Me.Heading.Degrees()
             state.arcAiming.Camp = false
-            saveCfg()
+            saveAnchors()
             printf('Camp set to current position.')
         end
     elseif sub == 'clearcamp' then
-        cfg.campLoc = nil; saveCfg()
+        cfg.campLoc = nil; saveAnchors()
         printf('Camp cleared.')
     elseif sub == 'setanchor' then
         local x, y, z = mq.TLO.Me.X(), mq.TLO.Me.Y(), mq.TLO.Me.Z()
@@ -3144,11 +3491,11 @@ local function cmd_puller(...)
             cfg.huntAnchor = { x = x, y = y, z = z, zone = currentZoneShortName() }
             cfg.huntHeading = mq.TLO.Me.Heading.Degrees()
             state.arcAiming.Hunt = false
-            saveCfg()
+            saveAnchors()
             printf('Hunt anchor set to current position.')
         end
     elseif sub == 'clearanchor' then
-        cfg.huntAnchor = nil; saveCfg()
+        cfg.huntAnchor = nil; saveAnchors()
         printf('Hunt anchor cleared (roaming unrestricted).')
     elseif sub == 'addwp' then
         local x, y, z = mq.TLO.Me.X(), mq.TLO.Me.Y(), mq.TLO.Me.Z()
@@ -3203,6 +3550,22 @@ local function cmd_puller(...)
             cfg.onEngageCommand = (text:lower() == 'clear') and '' or text
             saveCfg()
             printf('On Engage Command: %s', cfg.onEngageCommand ~= '' and cfg.onEngageCommand or '(blank)')
+        end
+    elseif sub == 'fightend' then
+        local text = restFrom(2)
+        if text ~= '' then
+            cfg.onFightEndCommand = (text:lower() == 'clear') and '' or text
+            saveCfg()
+        end
+        printf('On Fight End Command: %s', (cfg.onFightEndCommand or '') ~= '' and cfg.onFightEndCommand or '(blank)')
+    elseif sub == 'ksguard' then
+        setToggle('ksGuard', 'KS guard', arg1)
+    elseif sub == 'stats' then
+        if arg1 and arg1:lower() == 'reset' then
+            resetStats()
+            printf('Session stats reset.')
+        else
+            printf('%s', statsLine())
         end
     elseif sub == 'swarm' then
         if arg1 and arg1:lower() == 'count' then
@@ -3275,6 +3638,21 @@ do
         for _, loc in ipairs({ cfg.campLoc or false, cfg.huntAnchor or false }) do
             if loc and not loc.zone then loc.zone = zs; tagged = true end
         end
+        -- Configs from before per-zone anchors: file the existing camp/anchor
+        -- under the zone it belongs to (unless that zone already has one).
+        local function seed(loc, locKey, headKey, heading)
+            if not loc then return end
+            local a = cfg.zoneAnchors[loc.zone] or {}
+            if not a[locKey] then
+                a[locKey], a[headKey] = loc, heading
+                cfg.zoneAnchors[loc.zone] = a
+                tagged = true
+            end
+        end
+        seed(cfg.campLoc, 'campLoc', 'campHeading', cfg.campHeading)
+        seed(cfg.huntAnchor, 'huntAnchor', 'huntHeading', cfg.huntHeading)
+        -- Then use whatever's saved for the zone you're starting in.
+        loadZoneAnchors(zs)
         if tagged then saveCfg() end
     end
 end
@@ -3296,7 +3674,8 @@ while running do
     -- reason; cfg.enabled is left alone so pulling just continues fresh in
     -- the new zone instead of needing a manual /puller start every zone.
     local zoneId = mq.TLO.Zone.ID()
-    if zoneId ~= lastZoneId then
+    -- (Waits for the short name too: the per-zone camp swap below needs it.)
+    if zoneId ~= lastZoneId and currentZoneShortName() ~= '' then
         lastZoneId = zoneId
         state.tempIgnore = {}
         state.conCache = {}
@@ -3312,6 +3691,7 @@ while running do
         state.swarmTagged = false
         state.swarmAggroSince = nil
         state.conAskedAt = {}
+        state.statsSeen = {} -- spawn ids, same per-zone story
         -- The old /maploc marker belonged to the previous zone; forget it so
         -- syncMapCircle redraws here instead of assuming it's still shown.
         state.mapLocLoc = nil
@@ -3319,15 +3699,28 @@ while running do
         state.safeLocLoc = nil
         state.safeLocRadius = nil
         state.lootWaitSince = nil
-        -- campLoc/huntAnchor are coordinates in the zone they were set in.
-        -- Carrying on here would scan around (and, with Return to AP, walk
-        -- toward) a meaningless spot in this zone, so pause instead.
-        local anchor = cfg.pullMode == 'Camp' and cfg.campLoc or cfg.huntAnchor
+        -- campLoc/huntAnchor are coordinates in the zone they were set in:
+        -- swap in this zone's saved ones (if any). Pulling still pauses if
+        -- the old zone had one -- zoning mid-pull is usually a death, evac
+        -- or port, not a cue to walk straight back out to a camp.
         local zs = currentZoneShortName()
-        if cfg.enabled and anchor and anchor.zone and zs ~= '' and anchor.zone ~= zs then
-            stopPulling()
-            printf('Zoned out of %s (where the %s is set) -- pulling paused. Set a new one here, then /puller start.',
-                anchor.zone, cfg.pullMode == 'Camp' and 'camp' or 'hunt anchor')
+        if zs ~= '' then
+            local label = cfg.pullMode == 'Camp' and 'camp' or 'hunt anchor'
+            local old = cfg.pullMode == 'Camp' and cfg.campLoc or cfg.huntAnchor
+            loadZoneAnchors(zs)
+            local new = cfg.pullMode == 'Camp' and cfg.campLoc or cfg.huntAnchor
+            if cfg.enabled and old and old.zone ~= zs then
+                stopPulling()
+                if new then
+                    printf('Zoned into %s -- restored your saved %s here. Pulling paused; /puller start to resume.',
+                        zs, label)
+                else
+                    printf('Zoned out of %s (where the %s is set) -- pulling paused. Set a new one here, then /puller start.',
+                        old.zone or '?', label)
+                end
+            elseif new then
+                printf('Restored your saved %s for %s.', label, zs)
+            end
         end
     end
 
@@ -3351,6 +3744,7 @@ while running do
     if state.pullState == 'FIGHTING' and hasUnannouncedHostile() then
         queryE3State() -- throttled internally; safe to call every pass
     end
+    statsTick()
     pullTick()
     mq.delay(200)
 end
